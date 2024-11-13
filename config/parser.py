@@ -11,8 +11,8 @@ def json_to_args(json_path):
         args_dict[key] = value
     return args
 
-def parse_args(parser):
-    entry = parser.parse_args()
+def parse_args(parser, manual_args=None):
+    entry = parser.parse_args(manual_args)
     json_path = entry.cfg
     args = json_to_args(json_path)
     args_dict = args.__dict__
