@@ -9,13 +9,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.data as data
+import copy
 
-import pillow_heif
+from tqdm import tqdm
+
+# import pillow_heif
 from decord import VideoReader
 
 from config.parser import parse_args
 
 from sea_raft.raft import RAFT
+from sea_raft.utils.flow_viz import flow_to_image
 
 decord.bridge.set_bridge("torch")
 
@@ -107,6 +111,77 @@ def read_video_decord(video_path: str):
   frames = vr.get_batch(list(range(len(vr))))
   return frames
   
+@torch.no_grad()
+def flow_video(model, args, device=torch.device('cuda')):
+
+    video_path = './assets/videos/rubiks_cube.mp4'
+    output_path = './assets/videos/rubiks_cube_flow_lines.mp4'
+    
+    # Open the video file
+    cap = cv2.VideoCapture(video_path)
+
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
+
+    ret, frame1 = cap.read()
+    frame1 = cv2.cvtColor(frame1, cv2.COLOR_BGR2RGB)
+
+    while ret:
+        # Capture frame-by-frame
+        ret, frame2 = cap.read()
+        if not ret:
+            break
+        frame2 = cv2.cvtColor(frame2, cv2.COLOR_BGR2RGB)
+
+        image1 = torch.tensor(frame1, dtype=torch.float32).permute(2, 0, 1)
+        image2 = torch.tensor(frame2, dtype=torch.float32).permute(2, 0, 1)
+
+        H, W = image1.shape[1:]
+        image1 = image1[None].to(device)
+        image2 = image2[None].to(device)
+
+        H, W = image1.shape[2:]
+        flow, info = calc_flow(args, model, image1, image2)     # flow returned is (2, 1080, 1920)
+        # flow_vis = flow_to_image(flow[0].permute(1, 2, 0).cpu().numpy(), convert_to_bgr=True)
+
+        flow = flow[0].permute(2, 1, 0)             # flow is now (1920, 1080, 2)
+        flow_mag = torch.norm(flow, p=1, dim=-1)    # flow_mag is (1920, 1080)
+        thresholded_flow = flow[flow_mag > 20]      # thresholded_flow is flattened to (num_points, 2)
+        
+        H, W = flow.shape[:2]       # H = 1920, W = 1080
+        
+        uu, vv = torch.meshgrid(torch.arange(H), torch.arange(W))
+        indices = torch.stack((uu, vv), dim=-1)[flow_mag > 20]      # indices are taken from the meshgrid, same size as thresholded glow
+        correspondences = (indices + thresholded_flow).long().cpu().numpy()     
+        
+        # new_image1 = frame1[correspondences[..., 0], correspondences[..., 1]]
+
+        lines_img = copy.deepcopy(frame1)
+
+        for i in tqdm(range(0, correspondences.shape[0], 1000)):
+            cv2.line(lines_img, indices[i].numpy(), correspondences[i], color = [0, 255, 0], thickness = 2)
+
+        # new_image = copy.deepcopy(frame1)
+        # new_image[flow_mag < 20] = 0.
+
+        out.write(lines_img)
+        
+        # cv2.imwrite(f"{path}flow.jpg", flow_vis)
+        # heatmap = get_heatmap(info, args)
+        # vis_heatmap(f"{path}heatmap.jpg", image1[0].permute(1, 2, 0).cpu().numpy(), heatmap[0].permute(1, 2, 0).cpu().numpy())
+
+        frame1 = copy.deepcopy(frame2)        
+
+    # Release the video capture object
+    cap.release()
+    out.release()
+    # Close all OpenCV windows
+    cv2.destroyAllWindows()
+    # demo_data('./custom/', args, model, image1, image2)
 
 @torch.no_grad()
 def demo_custom(model, args, device=torch.device('cuda')):
@@ -121,7 +196,7 @@ def demo_custom(model, args, device=torch.device('cuda')):
     # image1 = torch.tensor(image1, dtype=torch.float32).permute(2, 0, 1)
     # image2 = torch.tensor(image2, dtype=torch.float32).permute(2, 0, 1)
     
-    frames = read_video_decord("custom/IMG_0010.MOV") #.permute(0, 3, 1, 2)
+    frames = read_video_decord("assets/videos/rubiks_cube.mp4") #.permute(0, 3, 1, 2)
     frame_idx = 26
     frame1 = frames[frame_idx]
     frame2 = frames[frame_idx + 1]
@@ -129,21 +204,29 @@ def demo_custom(model, args, device=torch.device('cuda')):
     image2 = frame2.permute(2, 0, 1)[None].to(device)
     
     flow, _ = calc_flow(args, model, image1, image2)
-    
     flow = flow[0].permute(1, 2, 0)
+
+    flow_mag = torch.norm(flow, p=1, dim=-1)
+    thresholded_flow = flow[flow_mag > 20]
     
     H, W = flow.shape[:2]
     
     uu, vv = torch.meshgrid(torch.arange(H), torch.arange(W))
-    indices = torch.stack((uu, vv), dim=-1)
-    correspondences = (indices + flow).long()
+    indices = torch.stack((uu, vv), dim=-1)[flow_mag > 20]
+    correspondences = (indices + thresholded_flow).long()
     
-    new_image1 = frame1[correspondences[..., 0], correspondences[..., 1]]
+    new_image1 = frame1[correspondences[..., 0], correspondences[..., 1]].numpy()
+
+    lines_img = frame1.numpy().astype(np.uint8)
+
+    for i in tqdm(range(0, correspondences.shape[0], 2000)):
+        cv2.line(lines_img, indices[i].numpy()[::-1], correspondences[i].numpy()[::-1], color = [0, 255, 0], thickness = 1)
     
-    cv2.imwrite("custom/predicted_next_correspondence.jpg", new_image1.numpy())
+    cv2.imwrite("custom/predicted_next_correspondence.jpg", new_image1)
+    cv2.imwrite("custom/lines_img.jpg", lines_img)
     
-    cv2.imwrite("custom/prev_frame.jpg", frame1.numpy())
-    cv2.imwrite("custom/next_frame.jpg", frame2.numpy())
+    # cv2.imwrite("custom/prev_frame.jpg", frame1.numpy())
+    # cv2.imwrite("custom/next_frame.jpg", frame2.numpy())
     
 
 def track_rigid_body(model, args, video_path, device):
@@ -162,6 +245,8 @@ def track_rigid_body(model, args, video_path, device):
         uu, vv = torch.meshgrid(torch.arange(H), torch.arange(W), indexing="ij")
         indices = torch.stack((uu, vv), dim=0)
         correspondences = (indices + flow[0]).long()  # Use this to index into image2
+
+        print("")
 
         # 3. From point correspondences, calculate camera matrices
         # 3.1. Calculate F with either 8pt or 7pt alg (RANSAC)
@@ -191,7 +276,8 @@ def main():
         device = torch.device('cpu')
     model = model.to(device)
     model.eval()
-    demo_custom(model, args, device=device)
+    # demo_custom(model, args, device=device)
+    flow_video(model, args, device=device)
 
 if __name__ == '__main__':
     main()
