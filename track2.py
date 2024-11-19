@@ -23,6 +23,8 @@ from config.parser import parse_args
 from sea_raft.raft import RAFT
 from sea_raft.utils.flow_viz import flow_to_image
 
+from views import Views
+
 decord.bridge.set_bridge("torch")
 
 def create_color_bar(height, width, color_map):
@@ -225,7 +227,6 @@ def demo_custom(model, args, device=torch.device('cuda')):
     
     # cv2.imwrite("custom/prev_frame.jpg", frame1.numpy())
     # cv2.imwrite("custom/next_frame.jpg", frame2.numpy())
-
 
 
 def pseudoinverse(A: torch.Tensor):
@@ -463,6 +464,13 @@ def track_rigid_body(model, args, video_path, device):
         # 7. Convert camera delta poses to object delta poses to visualize motion
     
 
+
+def optimize(args, video):
+
+    views = Views(args, video)
+    views.loss()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--cfg', help='experiment configure file name', required=True, type=str)
@@ -480,7 +488,8 @@ def main():
     model.eval()
     # demo_custom(model, args, device=device)
     # flow_video(model, args, device=device)
-    track_rigid_body(model, args, "assets/videos/rubiks_cube.mp4", device)
+    # track_rigid_body(model, args, "assets/videos/rubiks_cube.mp4", device)
+    optimize(args, "assets/videos/rubiks_cube.mp4")
 
 if __name__ == '__main__':
     main()
