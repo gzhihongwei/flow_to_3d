@@ -9,3 +9,7 @@ tensorboard
 h5py
 tqdm
 einops
+safetensors
+huggingface_hub
+opencv-python
+open3d

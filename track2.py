@@ -465,10 +465,15 @@ def track_rigid_body(model, args, video_path, device):
     
 
 
-def optimize(args, video):
-
-    views = Views(args, video)
-    views.loss()
+def optimize(args, video, model):
+    tensor = torch.tensor([1]).cuda()
+    video = read_video_decord(video).permute(0, 3, 1, 2).to(args.device)
+    image1 = video[:-1]
+    image2 = video[1:]
+    flow, _ = calc_flow(args, model, image1, image2)
+    views = Views(args, flow.cpu())
+    views = views.to(args.device)
+    views.optimization_step()
 
 
 def main():
@@ -485,11 +490,21 @@ def main():
     else:
         device = torch.device('cpu')
     model = model.to(device)
+    print(device)
     model.eval()
+    # print("model moved")
     # demo_custom(model, args, device=device)
     # flow_video(model, args, device=device)
     # track_rigid_body(model, args, "assets/videos/rubiks_cube.mp4", device)
-    optimize(args, "assets/videos/rubiks_cube.mp4")
+    tensor = torch.tensor([1]).to(device)
+    video = read_video_decord(video).permute(0, 3, 1, 2).to(device)
+    image1 = video[:-1]
+    image2 = video[1:]
+    flow, _ = calc_flow(args, model, image1, image2)
+    views = Views(args, flow.cpu())
+    views = views.to(args.device)
+    views.optimization_step()
+    optimize(args, "assets/videos/rubiks_cube.mp4", model)
 
 if __name__ == '__main__':
     main()
