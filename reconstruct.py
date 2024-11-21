@@ -10,6 +10,8 @@ from decord import VideoReader
 from sea_raft.raft import RAFT
 from views import Views
 
+from tqdm import tqdm
+
 
 @torch.no_grad()
 def forward_flow(args, model, image1, image2):
@@ -33,15 +35,38 @@ def read_video_decord(video_path: str):
   return frames
 
 def optimize(args, video, model):
-    tensor = torch.tensor([1]).cuda()
-    video = read_video_decord(video).permute(0, 3, 1, 2)#.to(args.device)
-    image1 = video[20:25]
-    image2 = video[21:26]
+    # tensor = torch.tensor([1]).cuda()
+    video = read_video_decord(video).permute(0, 3, 1, 2).to(args.device)
+    # TODO: might need to downsample/resize down
+    image1 = video[20:23]
+    image2 = video[21:24]
     flow, _ = calc_flow(args, model, image1, image2)
     flow = flow.permute(0, 2, 3, 1)
     views = Views(args, flow)
     views = views.to(args.device)
-    views.optimization_step()
+    # if is_module_on_device(views):
+    for _ in range(args.iterations):
+        views.optimization_step()
+    print(views.rots)
+    print(views.trans)
+    print(views.focal)
+
+
+
+def is_module_on_device(module, device_type="cuda"):
+    for name, param in module.named_parameters():
+        if param.device.type != device_type:
+            print(name)
+            return False
+    for name, buffer in module.named_buffers():
+        if buffer.device.type != device_type:
+            print(name)
+            return False
+    for key, value in module.__dict__.items():
+        if isinstance(value, torch.Tensor) and value.device.type != device_type:
+            print(key)
+            return False
+    return True
 
 def main():
     parser = argparse.ArgumentParser()
@@ -56,7 +81,7 @@ def main():
     #     device = torch.device('cuda')
     # else:
     #     device = torch.device('cpu')
-    # model = model.to(args.device)
+    model = model.to(args.device)
     # print(device)
     model.eval()
     # print("model moved")

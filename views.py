@@ -5,6 +5,8 @@ import torch.nn.functional as F
 from tqdm import tqdm
 import torch.nn as nn
 
+torch.autograd.set_detect_anomaly(True)
+
 class Views(nn.Module):
 
     def __init__(self, args, flow) -> None:
@@ -29,11 +31,12 @@ class Views(nn.Module):
         self.focal = nn.Parameter(torch.abs(torch.randn(1)))
 
         # Convert focal length to intrinsics:
-        self.K = torch.eye(3, device=self.device).unsqueeze(0)
-        self.K[0, 0, 0] = torch.abs(self.focal)
-        self.K[0, 1, 1] = torch.abs(self.focal)
-        self.Kt = torch.transpose(self.K, -1, -2)
-        self.Kt_inv = torch.transpose(torch.inverse(self.K), -1, -2)
+        self.K = torch.diag_embed(torch.tensor([self.focal, self.focal, 1.]).unsqueeze(0)).to(self.device)
+        # self.K = torch.diag(torch.tensor([self.focal, self.focal, 1])).unsqueeze(0)
+        # self.K[0, :2, :2] = torch.abs(self.focal)
+        # self.K[0, 1, 1] = torch.abs(self.focal)
+        self.Kt = torch.transpose(self.K, -1, -2).to(self.device)
+        self.Kt_inv = torch.transpose(torch.inverse(self.K), -1, -2).to(self.device)
 
         # self.K = torch.diag(torch.tensor([torch.abs(self.focal), torch.abs(self.focal), 1])).unsqueeze(0)
 
@@ -94,7 +97,7 @@ class Views(nn.Module):
         self.register_buffer("flow_mask", (flow_mag > 20).float())   
         # self.flow_mask = (flow_mag > 20).float()
         
-        vv, uu = torch.meshgrid(torch.arange(self.H), torch.arange(self.W), indexing="ij")
+        vv, uu = torch.meshgrid(torch.arange(self.H, device=self.device), torch.arange(self.W, device=self.device), indexing="ij")
 
         # Principal point is (0,0):
         vv = vv - self.H/2
@@ -239,13 +242,15 @@ class Views(nn.Module):
 
         return loss.mean()
 
-    def loss(self, rl_wt = 0.001, pl_wt = 1.):
+    def loss(self, rl_wt = 0.01, pl_wt = 1.):
 
         # Rotation matrix:
         self.R = self.convert_rot_to_matrix(self.rots)
 
         rl = self.reproj_loss()
+        print(f"{rl.item()=}")
         pl = self.point_loss()
+        print(f"{pl.item()=}")
 
         # TODO: x_prime requires grad for some reason, figure out why and make it constant.
 
@@ -258,7 +263,9 @@ class Views(nn.Module):
         # TODO: convert to gpu memory after flow prediction
 
         loss = self.loss()
-        loss.backward()
+        loss.backward(retain_graph=True)
+
+        # print(f"\r{loss.item()}", end="", flush=True)
 
         self.optimizer.step()
 
