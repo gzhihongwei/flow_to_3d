@@ -1,3 +1,5 @@
+import open3d as o3d
+import numpy as np
 import torch
 import decord
 decord.bridge.set_bridge("torch")
@@ -8,7 +10,7 @@ import torch.nn.functional as F
 from decord import VideoReader
 
 from sea_raft.raft import RAFT
-from views import Views
+from views import Views, get_correspondences, ransac_F, F_to_E, poses_from_E
 
 from tqdm import tqdm
 
@@ -35,22 +37,54 @@ def read_video_decord(video_path: str):
   return frames
 
 def optimize(args, video, model):
+
+    start = 20
+    end = 22
+
     # tensor = torch.tensor([1]).cuda()
     video = read_video_decord(video).permute(0, 3, 1, 2).to(args.device)
     # TODO: might need to downsample/resize down
-    image1 = video[20:23]
-    image2 = video[21:24]
+    image1 = video[start : end-1]
+    image2 = video[start+1 : end]
     flow, _ = calc_flow(args, model, image1, image2)
     flow = flow.permute(0, 2, 3, 1)
+
+    pts1, pts2 = get_correspondences(flow)
+    pts1 = pts1.cpu().detach().numpy()
+    pts2 = pts2.cpu().detach().numpy()
+
+    F, inliers = ransac_F(pts1, pts2, thresh = 0.4)
+    E = F_to_E(F)
+    poses = poses_from_E(E)
+    
+
     views = Views(args, flow)
     views = views.to(args.device)
-    # if is_module_on_device(views):
-    for _ in range(args.iterations):
-        views.optimization_step()
-    print(views.rots)
-    print(views.trans)
-    print(views.focal)
 
+    # TODO:
+    # 1. Plot the initial estimate of the camera poses in open3d
+    # 2. Initialize camera poses better (solving 8-pt algorithm?)
+    # 3. Take a slow motion video
+
+    geometries = views.visualize(video[start : end])
+    o3d.visualization.draw_geometries(geometries, window_name="Reconstruction")
+
+    for _ in tqdm(range(args.iterations)):
+        views.optimization_step()
+    print(views.rl)#, views.pl)
+    # print(views.rots)
+    # print(views.trans)
+    # print(views.focal)
+
+    # Visualize the point cloud
+    pts_vis = views.visualize(video[start : end])
+    o3d.visualization.draw_geometries(pts_vis, window_name="Random Point Cloud")
+
+    # Red: X-axis
+    # Green: Y-axis
+    # Blue: Z-axis
+
+    print("")
 
 
 def is_module_on_device(module, device_type="cuda"):

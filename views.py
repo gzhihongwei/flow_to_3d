@@ -4,6 +4,8 @@ from sea_raft.raft import RAFT
 import torch.nn.functional as F
 from tqdm import tqdm
 import torch.nn as nn
+import open3d as o3d
+import numpy as np
 
 torch.autograd.set_detect_anomaly(True)
 
@@ -26,9 +28,11 @@ class Views(nn.Module):
         # self.flow_model.to(self.device)
         # self.flow_model.eval()
         
-        self.rots = nn.Parameter(torch.randn(self.num_frames-1, 2, 3))      # 6D rotation representation, (v1, v2)
-        self.trans = nn.Parameter(torch.randn(self.num_frames-1, 3))
-        self.focal = nn.Parameter(torch.abs(torch.randn(1)))
+        # self.rots = nn.Parameter(torch.randn(self.num_frames-1, 2, 3))      # 6D rotation representation, (v1, v2)
+        self.rots = nn.Parameter(torch.eye(3)[:-1].unsqueeze(0).expand(self.num_frames - 1, -1, -1))      # 6D rotation representation, (v1, v2)
+        # self.trans = nn.Parameter(torch.randn(self.num_frames-1, 3))
+        self.register_buffer('trans', torch.tensor([[1., 1., 0.1]]).expand(self.num_frames - 1, -1,))
+        self.focal = nn.Parameter(torch.abs(200*torch.randn(1)))
 
         # Convert focal length to intrinsics:
         self.K = torch.diag_embed(torch.tensor([self.focal, self.focal, 1.]).unsqueeze(0)).to(self.device)
@@ -248,13 +252,17 @@ class Views(nn.Module):
         self.R = self.convert_rot_to_matrix(self.rots)
 
         rl = self.reproj_loss()
-        print(f"{rl.item()=}")
-        pl = self.point_loss()
-        print(f"{pl.item()=}")
+        # print(f"{rl.item()=}")
+        # pl = self.point_loss()
+        # print(f"{pl.item()=}")
+
+        self.rl = rl.item()
+        # self.pl = pl.item()
 
         # TODO: x_prime requires grad for some reason, figure out why and make it constant.
 
-        return pl * pl_wt + rl * rl_wt
+        # return pl * pl_wt + rl * rl_wt
+        return rl
     
     def optimization_step(self):
         self.optimizer.zero_grad()
@@ -268,6 +276,362 @@ class Views(nn.Module):
         # print(f"\r{loss.item()}", end="", flush=True)
 
         self.optimizer.step()
+    
+    @torch.no_grad()
+    def visualize(self, images):
+
+        # Rotation matrix:
+        self.R = self.convert_rot_to_matrix(self.rots)      # (batch, 3, 3)
+
+        P1 = torch.zeros((self.num_frames-1, 3, 4), device=self.device)
+        P2 = torch.zeros((self.num_frames-1, 3, 4), device=self.device)
+
+        P1[0, :3, :3] = torch.eye(3)
+        P1[1:, :3, :3] = self.R[:-1]
+        P1[1:, :3, 3] = self.trans[:-1]
+        P1 = torch.matmul(self.K, P1).unsqueeze(1).unsqueeze(1)
+
+        P2[:, :3, :3] = self.R[:]
+        P2[:, :3, 3] = self.trans[:]
+        P2 = torch.matmul(self.K, P2).unsqueeze(1).unsqueeze(1)     # Unsqueeze to accomodate height and width dimensions
+
+        geometries = []
+
+        for i in range(self.num_frames - 1):
+
+            x1_skew = self.skew_symmetric_matrix(self.x[0])
+            x2_skew = self.skew_symmetric_matrix(self.x_prime[i])
+
+            constraint1 = torch.matmul(x1_skew[..., :-1, :], P1[i])
+            constraint2 = torch.matmul(x2_skew[..., :-1, :], P2[i])
+
+            constraint_matrix = torch.concat([constraint1, constraint2], dim = -2)
+
+            U, S, Vh = torch.linalg.svd(constraint_matrix)
+            X = Vh[..., -1, :]
+
+            mask = self.flow_mask[i].bool()
+            pts3d = X[mask]
+            pts3d = pts3d / pts3d[:, -1, None]
+
+            pcd = np.zeros((pts3d.shape[0], 3))
+            colors = np.zeros((pts3d.shape[0], 3))
+
+            pcd[:, :] = pts3d[:, :-1].cpu().detach().numpy()
+            # all_pts.append(pcd)
+            colors[:, :] = (images[i, :, mask] / 255.).cpu().numpy().T
+            # all_colors.append(colors.T)
+
+            pts_vis = o3d.geometry.PointCloud()
+            pts_vis.points = o3d.utility.Vector3dVector(pcd)
+            pts_vis.colors = o3d.utility.Vector3dVector(colors)
+
+            geometries.append(pts_vis)
+
+            # p1_camera = o3d.geometry.LineSet.create_camera_visualization(view_width_px=self.W, view_height_px=self.H, intrinsic=np.diag([self.focal, self.focal, 1.]), extrinsic=)
+        
+        T = np.eye(4)
+        for i in range(self.num_frames):
+
+            if i != 0:
+                T[:3, :3] = self.R[i-1].cpu().detach().numpy()
+                T[:3, 3] = self.trans[i-1].cpu().detach().numpy()
+
+            frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1., origin=[0, 0, 0])
+            frame.transform(T.copy())
+
+            # text_position = T[:3, 3]  # Extract translation (camera position)
+            # label_geometry = o3d.visualization.Text3D(
+            #     text=f"Camera {i}",
+            #     position=text_position,
+            #     direction=(0, 0, -1),  # Text faces -Z direction
+            #     up=(0, 1, 0),          # Up direction is Y
+            #     font_size=20   # Scale the font size
+            # )
+
+            geometries.append(frame)
+            # geometries.append(label_geometry)
+
+        return geometries
+    
+    def visualize_sanity(self, images):
+
+        # Rotation matrix:
+        # self.R = self.convert_rot_to_matrix(self.rots)
+
+        # P1 = torch.zeros((self.num_frames-1, 3, 4), device=self.device)
+        # P2 = torch.zeros((self.num_frames-1, 3, 4), device=self.device)
+
+        P1 = torch.tensor(np.load("sanity/P1.npy"), dtype=torch.float32).unsqueeze(0)
+        P2 = torch.tensor(np.load("sanity/P2.npy"), dtype=torch.float32).unsqueeze(0)
+
+        x = np.load("sanity/pts1.npy")
+        x_prime = np.load("sanity/pts2.npy")
+
+        x1_skew = self.skew_symmetric_matrix(self.homogenize(torch.tensor(x)))
+        x2_skew = self.skew_symmetric_matrix(self.homogenize(torch.tensor(x_prime)))
+
+        constraint1 = torch.matmul(x1_skew[..., :-1, :], P1)
+        constraint2 = torch.matmul(x2_skew[..., :-1, :], P2)
+
+        constraint_matrix = torch.concat([constraint1, constraint2], dim = -2)
+        U, S, Vh = torch.linalg.svd(constraint_matrix)
+        X = Vh[..., -1, :]
+
+        pts3d = (X / X[:, -1, None])
+
+        pcd = np.zeros((pts3d.shape[0], 3))
+
+        pcd[:, :] = pts3d[:, :-1].cpu().numpy()
+
+        
+        pts_vis = o3d.geometry.PointCloud()
+        pts_vis.points = o3d.utility.Vector3dVector(pcd)
+
+            # p1_camera = o3d.geometry.LineSet.create_camera_visualization(view_width_px=self.W, view_height_px=self.H, intrinsic=np.diag([self.focal, self.focal, 1.]), extrinsic=)
+        return [pts_vis]
+    
+def get_inliers(F, pts1, pts2, thresh=1e-10):
+
+    pts1 = homogenize_2d(pts1)
+    pts2 = homogenize_2d(pts2)
+
+    l1 = pts1 @ F.T
+    l2 = pts2 @ F
+
+    d1 = np.abs((l1 * pts2).sum(axis=1)) / np.linalg.norm(l1[:, :2], axis=1)
+    d2 = np.abs((l2 * pts1).sum(axis=1)) / np.linalg.norm(l2[:, :2], axis=1)
+
+    return d1 + d2
+
+    # prod = np.diag(pts2 @ F @ (pts1.T))
+    # inliers = prod[np.abs(prod) < thresh]
+
+    return inliers
+
+def homogenize_2d(pts):
+    
+    assert pts.shape[-1] == 3 or pts.shape[-1] == 2
+
+    if pts.shape[-1] == 2:
+        return np.append(pts, np.ones((*pts.shape[:-1], 1)), axis = -1)
+    else:
+        return pts
+
+def skew_symmetric_matrix(v):
+
+    matrix = torch.zeros((*v.shape[:-1], 3, 3), device=v.device)
+    
+    matrix[..., 0, 1] = -v[..., 2]
+    matrix[..., 0, 2] = v[..., 1]
+    matrix[..., 1, 2] = -v[..., 0]
+
+    matrix[..., 1, 0] = v[..., 2]
+    matrix[..., 2, 0] = -v[..., 1]
+    matrix[..., 2, 1] = v[..., 0]
+
+    return matrix
+
+def normalize_coordinates(pts):
+
+    assert type(pts) == np.ndarray
+    assert len(pts.shape) == 2
+    assert pts.shape[1] == 2
+
+    n = pts.shape[0]
+
+    x = pts[:, 0]
+    y = pts[:, 1]
+    x0, y0 = np.mean(x), np.mean(y)
+
+    d_avg = np.mean(np.sqrt((x - x0)**2 + (y - y0)**2))
+    s = np.sqrt(2) / d_avg
+
+    T = np.array([[s, 0., -s * x0],
+                  [0., s, -s * y0],
+                  [0., 0., 1.]])
+    
+    pts_hat = (T @ (homogenize_2d(pts).T)).T
+
+    return pts_hat, T
+
+def null_space(A, num=1):
+
+    U, S, Vh = np.linalg.svd(A)
+    return Vh[-num:, :]
+
+def homogenize(v):
+    ones = torch.ones((*v.shape[:-1], 1), device=v.device)
+    return torch.cat((v, ones), dim=-1)
+
+def get_correspondences(flow):
+
+    H = flow.size(1)
+    W = flow.size(2)
+
+    flow_mag = torch.norm(flow, p=1, dim=-1)
+    flow_mask = (flow_mag > 20)
+    # self.flow_mask = (flow_mag > 20).float()
+    
+    vv, uu = torch.meshgrid(torch.arange(H, device=flow.device), torch.arange(W, device=flow.device), indexing="ij")
+
+    # Principal point is (0,0):
+    vv = vv - H/2
+    uu = uu - W/2
+
+    indices = torch.stack((uu, vv), dim=0).unsqueeze(0)
+    indices = indices.permute(0, 2, 3, 1)
+
+    # Note; Indices are switched and added to flow, because the flow predictions are switched => (x, y) corresponds to (W, H)
+    # homogenized_inds = homogenize(indices)
+
+    correspondences = indices + flow
+    # homogenized_corr = homogenize(correspondences)
+
+    indices = indices[flow_mask]
+    correspondences = correspondences[flow_mask]
+    
+    
+    return indices, correspondences
+
+def compute_F_8pt(pts1, pts2):
+
+    assert pts1.shape[0] >= 8 and pts2.shape[0] >= 8
+
+    # Normalize coordinates:
+    pts1_hat, T1 = normalize_coordinates(pts1)
+    pts2_hat, T2 = normalize_coordinates(pts2)
+
+    # Define A matrix for constraints on F:
+    x1, y1, z1 = pts1_hat[:, 0], pts1_hat[:, 1], pts1_hat[:, 2]
+    x2, y2, z2 = pts2_hat[:, 0], pts2_hat[:, 1], pts2_hat[:, 2]
+    A = np.column_stack([x2*x1, x2*y1, x2*z1, y2*x1, y2*y1, y2*z1, z2*x1, z2*y1, z2*z1])
+
+    # Recover normalized F from null space:
+    f = null_space(A)
+    F_hat = np.reshape(f, (3,3))
+
+    # Project to rank 2 to constrain detF=0
+    U, S, Vh = np.linalg.svd(F_hat)
+    S[-1] = 0
+    F_hat = U @ np.diag(S) @ Vh
+
+    # Project back to pixel space:
+    F = (T2.T) @ F_hat @ T1
+
+    return F
+
+def ransac_F(pts1, pts2, num_iters = 1000, thresh = 1e-3):
+    num_inliers = 0
+    best_F = None
+
+    for i in tqdm(range(num_iters)):
+        pt_indices = np.random.choice(pts1.shape[0], 8, replace=False)
+        p1, p2 = pts1[pt_indices], pts2[pt_indices]
+
+        F = compute_F_8pt(p1, p2)
+
+        # inliers = get_inliers(F, pts1, pts2, thresh=thresh)
+        errors = get_inliers(F, pts1, pts2, thresh=thresh)
+
+        inliers = errors[errors < thresh]
+
+        if len(inliers) > num_inliers:
+            best_F = F
+            num_inliers = len(inliers)
+
+    inlier_percent = num_inliers / pts1.shape[0]
+    
+    return best_F, inlier_percent
+
+def F_to_E(F):
+
+    U, S, Vh = np.linalg.svd(F)
+
+    S_ones = np.eye(3)
+    S_ones[-1, -1] = 0
+
+    E = U @ S_ones @ Vh
+
+    return E
+
+def poses_from_E(E):
+
+    W = np.array([[0, -1., 0.],
+                  [1., 0., 0.],
+                  [0., 0., 1.]])
+    
+    U, S, Vh = np.linalg.svd(E)
+
+    C1 = U[:, -1]
+    C2 = -U[:, -1]
+
+    R1 = U @ W @ Vh
+    R2 = U @ (W.T) @ Vh
+
+    if np.linalg.det(R1) < 0:
+        r1_correct = -1
+    else:
+        r1_correct = 1.
+
+    if np.linalg.det(R2) < 0:
+        r2_correct = -1
+    else:
+        r2_correct = 1.    
+
+    return [(r1_correct * C1, r1_correct * R1), (r1_correct * C2, r1_correct * R1), 
+            (r2_correct * C1, r2_correct * R2), (r2_correct * C2, r2_correct * R2)]
+
+def visualize_poses(self, P2, x, x_prime):
+
+    P1 = torch.zeros((1, 3, 4), dtype=torch.float32, device = "cuda")
+    P1[:, :3, :3] = torch.eye(3)
+
+    P2 = torch.tensor(P2, dtype=torch.float32, device = "cuda").unsqueeze(0)
+
+    x = torch.tensor(x, dtype=torch.float32, device = "cuda")
+    x_prime = torch.tensor(x_prime, dtype=torch.float32, device = "cuda")
+
+    x1_skew = self.skew_symmetric_matrix(homogenize(x))
+    x2_skew = self.skew_symmetric_matrix(homogenize(x_prime))
+
+    constraint1 = torch.matmul(x1_skew[..., :-1, :], P1)
+    constraint2 = torch.matmul(x2_skew[..., :-1, :], P2)
+
+    constraint_matrix = torch.concat([constraint1, constraint2], dim = -2)
+    U, S, Vh = torch.linalg.svd(constraint_matrix)
+    X = Vh[..., -1, :]
+
+    pts3d = (X / X[:, -1, None])
+
+    pcd = np.zeros((pts3d.shape[0], 3))
+    pcd[:, :] = pts3d[:, :-1].cpu().detach().numpy()
+    colors = np.zeros((pts3d.shape[0], 3))
+    colors[:, :] = (images[i, :, mask] / 255.).cpu().numpy().T
+
+    pts_vis = o3d.geometry.PointCloud()
+    pts_vis.points = o3d.utility.Vector3dVector(pcd)
+    pts_vis.colors = o3d.utility.Vector3dVector(colors)
+
+    T1 = np.eye(4)
+    T2 = T1.copy()
+
+    T2[:3, :3] = P2[:3, :3].cpu().detach().numpy()
+    T2[:3, 3] = P2[:3, 3].cpu().detach().numpy()
+
+    frame1 = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1., origin=[0, 0, 0])
+    frame2 = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1., origin=[0, 0, 0])
+    frame2.transform(T2.copy())
+
+    geometries.append(frame1)
+    geometries.append(frame2)
+    # geometries.append(label_geometry)
+
+return geometries
+
+        # p1_camera = o3d.geometry.LineSet.create_camera_visualization(view_width_px=self.W, view_height_px=self.H, intrinsic=np.diag([self.focal, self.focal, 1.]), extrinsic=)
+    return [pts_vis]
+
 
     
 
