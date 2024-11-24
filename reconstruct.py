@@ -6,11 +6,12 @@ decord.bridge.set_bridge("torch")
 import argparse
 from config.parser import parse_args
 import torch.nn.functional as F
+import cv2
 
 from decord import VideoReader
 
 from sea_raft.raft import RAFT
-from views import Views, get_correspondences, ransac_F, F_to_E, poses_from_E
+from views import Views, get_correspondences, ransac_F, F_to_E, F_to_P, triangulate, poses_from_E, visualize_poses, plot_epipolar_lines
 
 from tqdm import tqdm
 
@@ -39,24 +40,60 @@ def read_video_decord(video_path: str):
 def optimize(args, video, model):
 
     start = 20
-    end = 22
+    end = 24
 
     # tensor = torch.tensor([1]).cuda()
     video = read_video_decord(video).permute(0, 3, 1, 2).to(args.device)
     # TODO: might need to downsample/resize down
-    image1 = video[start : end-1]
-    image2 = video[start+1 : end]
+    image1 = video[start : end-3]
+    image2 = video[start+3 : end]
     flow, _ = calc_flow(args, model, image1, image2)
     flow = flow.permute(0, 2, 3, 1)
 
-    pts1, pts2 = get_correspondences(flow)
-    pts1 = pts1.cpu().detach().numpy()
-    pts2 = pts2.cpu().detach().numpy()
+    # pts1, pts2, rgb = get_correspondences(flow, image1)
+    # pts1 = pts1.cpu().detach().numpy()
+    # pts2 = pts2.cpu().detach().numpy()
 
-    F, inliers = ransac_F(pts1, pts2, thresh = 0.4)
-    E = F_to_E(F)
-    poses = poses_from_E(E)
+    pts1 = np.load("sanity/pts1.npy")
+    pts2 = np.load("sanity/pts2.npy")
+    P1_true = np.load("sanity/P1.npy")
+    P2_true = np.load("sanity/P2.npy")
+    img1 = cv2.imread("sanity/img1.jpg")
+    img2 = cv2.imread("sanity/img2.jpg")
+    rgb = None
+
+    pts1_norm = pts1 - np.array([img1.shape[1]/2, img1.shape[0]/2])
+    pts2_norm = pts2 - np.array([img1.shape[1]/2, img1.shape[0]/2])
     
+    F, inliers = ransac_F(pts1, pts2, thresh = 1.)
+    print("Inlier ratio = ", inliers)
+    inds = np.arange(8) * 1000
+    # plot_epipolar_lines(F, pts1_norm[inds], pts2_norm[inds], img1, img2)
+    # geometries = visualize_poses(P1_true, P2_true, pts1, pts2, rgb)
+    # o3d.visualization.draw_geometries(geometries, window_name="Reconstruction")
+
+    P = F_to_P(F, v = np.array([0., 0., 0.]), lamb = 1.)
+    #array([ 9.99940307e-01,  1.09262649e-02, -1.06444347e-06])
+
+    geometries = visualize_poses(P, pts1, pts2, rgb)
+    o3d.visualization.draw_geometries(geometries, window_name="Reconstruction")
+
+    # E = F_to_E(F)
+    poses = poses_from_E(F)
+
+    P = np.zeros((3, 4))
+    for pose in poses:
+
+        P[:, :3] = pose[1] # R
+        P[:, 3] = pose[0] #pose[1] @ -pose[0]  # C
+
+        X = triangulate(P, pts1, pts2)
+
+        # cheirality = (X - pose[0].cpu()) > 0  # TODO: premultiply row 3
+
+        # print(cheirality.sum())
+        geometries = visualize_poses(P, pts1, pts2, rgb)
+        o3d.visualization.draw_geometries(geometries, window_name="Reconstruction")
 
     views = Views(args, flow)
     views = views.to(args.device)

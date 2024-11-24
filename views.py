@@ -6,8 +6,21 @@ from tqdm import tqdm
 import torch.nn as nn
 import open3d as o3d
 import numpy as np
+import cv2
+import matplotlib.pyplot as plt
 
 torch.autograd.set_detect_anomaly(True)
+
+COLORS = [
+    (255, 0, 0),    # Blue
+    (0, 255, 0),    # Green
+    (0, 0, 255),    # Red
+    (0, 165, 255),  # Orange
+    (255, 0, 255),  # Magenta (Pink)
+    (0, 255, 255),  # Yellow
+    (255, 255, 0),  # Cyan
+    (128, 0, 128)   # Purple
+]
 
 class Views(nn.Module):
 
@@ -418,9 +431,12 @@ def homogenize_2d(pts):
     else:
         return pts
 
-def skew_symmetric_matrix(v):
+def skew_symmetric_matrix(v, mode = "torch"):
 
-    matrix = torch.zeros((*v.shape[:-1], 3, 3), device=v.device)
+    if mode == 'torch':
+        matrix = torch.zeros((*v.shape[:-1], 3, 3), device=v.device)
+    elif mode == "numpy":
+        matrix = np.zeros((*v.shape[:-1], 3, 3))
     
     matrix[..., 0, 1] = -v[..., 2]
     matrix[..., 0, 2] = v[..., 1]
@@ -464,10 +480,11 @@ def homogenize(v):
     ones = torch.ones((*v.shape[:-1], 1), device=v.device)
     return torch.cat((v, ones), dim=-1)
 
-def get_correspondences(flow):
+def get_correspondences(flow, image):
 
     H = flow.size(1)
     W = flow.size(2)
+    image = image.permute(0, 2, 3, 1)
 
     flow_mag = torch.norm(flow, p=1, dim=-1)
     flow_mask = (flow_mag > 20)
@@ -490,9 +507,10 @@ def get_correspondences(flow):
 
     indices = indices[flow_mask]
     correspondences = correspondences[flow_mask]
+    rgb = image[flow_mask]
     
     
-    return indices, correspondences
+    return indices, correspondences, rgb
 
 def compute_F_8pt(pts1, pts2):
 
@@ -555,6 +573,43 @@ def F_to_E(F):
 
     return E
 
+def F_to_P(F, v = np.array([0., 0., 0.]), lamb = 1.):
+
+    U, S, Vh = np.linalg.svd(F.T)
+    epipole = Vh[-1, :]
+
+    ep_skew = skew_symmetric_matrix(epipole, mode="numpy")
+
+    P = np.zeros((3, 4))
+    P[:, :3] = ep_skew @ F + (epipole[:, np.newaxis] @ v[np.newaxis, :])
+    P[:, 3] = lamb * epipole
+
+    return P
+
+def triangulate(P2, x, x_prime):
+    P1 = torch.zeros((1, 3, 4), dtype=torch.float32, device = "cuda")
+    P1[:, :3, :3] = torch.eye(3)
+
+    P2 = torch.tensor(P2, dtype=torch.float32, device = "cuda").unsqueeze(0)
+
+    x = torch.tensor(x, dtype=torch.float32, device = "cuda")
+    x_prime = torch.tensor(x_prime, dtype=torch.float32, device = "cuda")
+
+    x1_skew = skew_symmetric_matrix(homogenize(x))
+    x2_skew = skew_symmetric_matrix(homogenize(x_prime))
+
+    constraint1 = torch.matmul(x1_skew[..., :-1, :], P1)
+    constraint2 = torch.matmul(x2_skew[..., :-1, :], P2)
+
+    constraint_matrix = torch.concat([constraint1, constraint2], dim = -2)
+    U, S, Vh = torch.linalg.svd(constraint_matrix)
+    X = Vh[..., -1, :]
+
+    pts3d = (X / X[:, -1, None])[:, :-1]
+
+    return pts3d
+
+
 def poses_from_E(E):
 
     W = np.array([[0, -1., 0.],
@@ -577,60 +632,129 @@ def poses_from_E(E):
     if np.linalg.det(R2) < 0:
         r2_correct = -1
     else:
-        r2_correct = 1.    
+        r2_correct = 1.
+
+    print(r1_correct, r2_correct)    
 
     return [(r1_correct * C1, r1_correct * R1), (r1_correct * C2, r1_correct * R1), 
             (r2_correct * C1, r2_correct * R2), (r2_correct * C2, r2_correct * R2)]
 
-def visualize_poses(self, P2, x, x_prime):
-
-    P1 = torch.zeros((1, 3, 4), dtype=torch.float32, device = "cuda")
-    P1[:, :3, :3] = torch.eye(3)
-
-    P2 = torch.tensor(P2, dtype=torch.float32, device = "cuda").unsqueeze(0)
-
-    x = torch.tensor(x, dtype=torch.float32, device = "cuda")
-    x_prime = torch.tensor(x_prime, dtype=torch.float32, device = "cuda")
-
-    x1_skew = self.skew_symmetric_matrix(homogenize(x))
-    x2_skew = self.skew_symmetric_matrix(homogenize(x_prime))
-
-    constraint1 = torch.matmul(x1_skew[..., :-1, :], P1)
-    constraint2 = torch.matmul(x2_skew[..., :-1, :], P2)
-
-    constraint_matrix = torch.concat([constraint1, constraint2], dim = -2)
-    U, S, Vh = torch.linalg.svd(constraint_matrix)
-    X = Vh[..., -1, :]
-
-    pts3d = (X / X[:, -1, None])
+def visualize_poses(P2, x, x_prime, rgb = None):
+    pts3d = triangulate(P2, x, x_prime)
 
     pcd = np.zeros((pts3d.shape[0], 3))
-    pcd[:, :] = pts3d[:, :-1].cpu().detach().numpy()
-    colors = np.zeros((pts3d.shape[0], 3))
-    colors[:, :] = (images[i, :, mask] / 255.).cpu().numpy().T
+    pcd[:, :] = pts3d.cpu().detach().numpy()
 
+    if rgb is not None:
+        colors = np.zeros((pts3d.shape[0], 3))
+        colors[:, :] = (rgb / 255.).cpu().detach().numpy()
+
+    geometries = []
     pts_vis = o3d.geometry.PointCloud()
     pts_vis.points = o3d.utility.Vector3dVector(pcd)
-    pts_vis.colors = o3d.utility.Vector3dVector(colors)
+    if rgb is not None:
+        pts_vis.colors = o3d.utility.Vector3dVector(colors)
+    geometries.append(pts_vis)
 
-    T1 = np.eye(4)
-    T2 = T1.copy()
+    # T = np.eye(4)
+    # # T[:3, :3] = P2[0, :3, :3].cpu().detach().numpy()
+    # # T[:3, 3] = P2[0, :3, 3].cpu().detach().numpy()
+    # T[:3, :3] = P2[:3, :3]
+    # T[:3, 3] = P2[:3, 3]
 
-    T2[:3, :3] = P2[:3, :3].cpu().detach().numpy()
-    T2[:3, 3] = P2[:3, 3].cpu().detach().numpy()
+    # frame1 = o3d.geometry.TriangleMesh.create_coordinate_frame(size=5., origin=[0, 0, 0])
+    # frame2 = o3d.geometry.TriangleMesh.create_coordinate_frame(size=5., origin=[0, 0, 0])
+    # frame2.transform(T.copy())
 
-    frame1 = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1., origin=[0, 0, 0])
-    frame2 = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1., origin=[0, 0, 0])
-    frame2.transform(T2.copy())
-
-    geometries.append(frame1)
-    geometries.append(frame2)
+    # geometries.append(frame1)
+    # geometries.append(frame2)
     # geometries.append(label_geometry)
 
-return geometries
+    return geometries
 
         # p1_camera = o3d.geometry.LineSet.create_camera_visualization(view_width_px=self.W, view_height_px=self.H, intrinsic=np.diag([self.focal, self.focal, 1.]), extrinsic=)
-    return [pts_vis]
+    # return [pts_vis]
+
+def epipolar_lines(F, pts1, pts2):
+
+    pts1 = homogenize_2d(pts1)
+    pts2 = homogenize_2d(pts2)
+    
+    l1 = ((F.T) @ (pts2.T)).T
+    l2 = (F @ (pts1.T)).T
+
+    return l1, l2
+
+def find_line_intersect_with_borders(line, img):
+
+    height, width = img.shape[:2]
+    a, b, c = line[:, 0], line[:, 1], line[:, 2]
+
+    x0 = np.zeros_like(a)
+    y0 = -c/b
+    x1 = np.ones_like(a) * width-1
+    y1 = (-a * (width-1) -c) / b
+
+    line_pts = np.column_stack([x0, y0, x1, y1])
+    
+    return line_pts
+
+def plot_epipolar_lines(F, pts1, pts2, img1, img2):
+
+    el1, el2 = epipolar_lines(F, pts1, pts2)
+
+    el1_pts = find_line_intersect_with_borders(el1, img1)
+    el2_pts = find_line_intersect_with_borders(el2, img2)
+
+    img1_pts = img1.copy()
+    for i in range(pts1.shape[0]):
+        cv2.circle(img1_pts, tuple(pts1[i, :2].astype(np.int64)), radius=8, color=COLORS[i], thickness=-1)
+
+    # cv2.imshow('Viewpoint 1 Points', img1_pts)
+    cv2.imwrite('img1_pts.jpg', img1_pts)
+    
+    # plt.imshow(img1_pts)
+    # plt.show()
+    # cv2.waitKey(0)
+
+    img2_lines = img2.copy()
+    for i in range(el2_pts.shape[0]):
+        line = el2_pts[i].astype(np.int64)
+        cv2.line(img2_lines, (line[0], line[1]), (line[2], line[3]), color=COLORS[i], thickness=4)     # line is arranged as (x0, y0, x1, y1)
+
+    cv2.imwrite('img2_lines.jpg', img2_lines)
+    # cv2.imshow('Viewpoint 2 Lines', img2_lines)
+    # cv2.waitKey(0)
+
+    # plt.imshow(img2_lines)
+    # plt.show()
+
+    img2_pts = img2.copy()
+    for i in range(pts2.shape[0]):
+        cv2.circle(img2_pts, tuple(pts2[i, :2].astype(np.int64)), radius=8, color=COLORS[i], thickness=-1)
+
+    cv2.imwrite('img2_pts.jpg', img2_pts)
+    # cv2.imshow('Viewpoint 2 Points', img2_pts)
+    # cv2.waitKey(0)
+
+    # plt.imshow(img2_pts)
+    # plt.show()
+
+    img1_lines = img1.copy()
+    for i in range(el1_pts.shape[0]):
+        line = el1_pts[i].astype(np.int64)
+        cv2.line(img1_lines, (line[0], line[1]), (line[2], line[3]), color=COLORS[i], thickness=4)     # line is arranged as (x0, y0, x1, y1)
+
+    # cv2.imshow('Viewpoint 1 Lines', img1_lines)
+    # cv2.waitKey(0)
+
+    cv2.imwrite('img1_lines.jpg', img1_lines)
+    # plt.imshow(img1_lines)
+    # plt.show()
+
+    # cv2.destroyAllWindows()
+
+    return img1_pts, img2_pts, img1_lines, img2_lines
 
 
     
