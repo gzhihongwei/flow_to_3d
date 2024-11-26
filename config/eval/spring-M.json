@@ -9,11 +9,12 @@
     "pretrain": "resnet34",
     "initial_dim": 64,
     "block_dims": [64, 128, 256],
+
     "radius": 4,
     "dim": 128,
     "num_blocks": 2,
     "iters": 4,
-    "iterations": 5000,
+    "iterations": 1000,
 
     "image_size": [540, 960],
     "scale": -1,

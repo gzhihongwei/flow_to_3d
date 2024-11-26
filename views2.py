@@ -734,11 +734,11 @@ def F_to_P(F, v = np.array([0., 0., 0.]), lamb = 1.):
 
     return P
 
-def triangulate(P2, x, x_prime, rgb = None):
+def triangulate(K, P2, x, x_prime, rgb = None):
     P1 = torch.zeros((1, 3, 4), dtype=torch.float32, device = "cuda")
-    P1[:, :3, :3] = torch.eye(3)
+    P1[:, :3, :3] = torch.tensor(K, device="cuda")
 
-    P2 = torch.tensor(P2, dtype=torch.float32, device = "cuda").unsqueeze(0)
+    P2 = torch.tensor(K @ P2, dtype=torch.float32, device = "cuda").unsqueeze(0)
 
     x = torch.tensor(x, dtype=torch.float32, device = "cuda")
     x_prime = torch.tensor(x_prime, dtype=torch.float32, device = "cuda")
@@ -769,7 +769,7 @@ def triangulate(P2, x, x_prime, rgb = None):
         pts_vis.colors = o3d.utility.Vector3dVector(colors)
     geometries.append(pts_vis)
 
-    return pts3d
+    return pts3d, geometries
 
 
 def poses_from_E(E):
