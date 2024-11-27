@@ -25,12 +25,12 @@ COLORS = [
 ]
 
 class Camera(nn.Module):
-    def __init__(self, r, t):
+    def __init__(self, r, t, requires_grad=True):
 
         super().__init__()
 
-        self.r = nn.Parameter(torch.tensor(r, dtype = torch.float32))        
-        self.t = nn.Parameter(torch.tensor(t, dtype = torch.float32))
+        self.r = nn.Parameter(torch.tensor(r, dtype = torch.float32), requires_grad=requires_grad)        
+        self.t = nn.Parameter(torch.tensor(t, dtype = torch.float32), requires_grad=requires_grad)
 
         # self.register_buffer("r", torch.tensor(r, dtype = torch.float32))
         # self.register_buffer("t", torch.tensor(t, dtype = torch.float32))
@@ -45,7 +45,7 @@ class Camera(nn.Module):
         Returns:
             torch.Tensor: Rotation matrix of shape (3, 3) or (N, 3, 3).
         """
-        r_cv2 = cv2.Rodrigues(self.r.cpu().detach().numpy())
+        # r_cv2 = cv2.Rodrigues(self.r.cpu().detach().numpy())
         
         batch = self.r.ndim == 2
         if not batch:
@@ -76,8 +76,8 @@ class Camera(nn.Module):
         R = self.convert_to_rot_matrix()
 
         x = torch.matmul(K,
-                            torch.matmul(R, X.t()) + self.t.unsqueeze(-1))
-        x = x / x[-1]
+                            torch.matmul(R, X.t()) + self.t)
+        x = x / (x[-1] + 1e-8)
         x = x.t()
         x = x[:, :-1]
 
@@ -89,7 +89,7 @@ class Camera(nn.Module):
         return torch.cat((self.R, self.t[:, None]), axis=-1)
     
 class GlobalOptimization(nn.Module):
-    def __init__(self, K, x0, x1, x2, X, r1, t1, r2, t2):
+    def __init__(self, K, x0, x1, x2, X, r1, t1, r2, t2, r0 = None, t0 = None, cam1_requires_grad=True):
 
         super().__init__()
 
@@ -101,16 +101,23 @@ class GlobalOptimization(nn.Module):
         self.X = nn.Parameter(torch.tensor(X, dtype = torch.float32))
         # self.register_buffer("X", torch.tensor(X, dtype = torch.float32))
 
-        self.cam1 = Camera(r1, t1)
+        if r0 is None:
+            r0 = np.zeros(3)
+
+        if t0 is None:
+            t0 = np.zeros((3, 1))
+
+        self.cam0 = Camera(r0, t0, requires_grad=False)
+        self.cam1 = Camera(r1, t1, requires_grad=cam1_requires_grad)
         self.cam2 = Camera(r2, t2)
     
     def forward(self):
+        # x0_pred = torch.matmul(self.K, self.X.t())
+        # x0_pred = x0_pred / x0_pred[-1]
+        # x0_pred = x0_pred.t()
+        # x0_pred = x0_pred[:, :-1]
 
-        x0_pred = torch.matmul(self.K, self.X.t())
-        x0_pred = x0_pred / x0_pred[-1]
-        x0_pred = x0_pred.t()
-        x0_pred = x0_pred[:, :-1]
-
+        x0_pred = self.cam0(self.K, self.X)
         x1_pred = self.cam1(self.K, self.X)
         x2_pred = self.cam2(self.K, self.X)
 
@@ -269,10 +276,15 @@ def F_to_E(F):
     return E
 
 
-def reconstruct_3_frames(K, video, i, flow_model, args):
+def reconstruct_3_frames(K, R0, t0, video, i, flow_model, args, R1 = None, t1 = None):
     prev_frame = video[i, None]
-    curr_frame = video[i + 2, None]
-    next_frame = video[i + 4, None]
+    curr_frame = video[i + args.skip*1, None]
+    next_frame = video[i + args.skip*2, None]
+
+    is_beginning = False
+
+    if R1 is None and t1 is None:
+        is_beginning = True
 
     # Flows
     back_flow = predict_flow_images(curr_frame, prev_frame, flow_model, args)
@@ -284,6 +296,7 @@ def reconstruct_3_frames(K, video, i, flow_model, args):
 
     # Correspondences
     correspondence_mask = (back_flow_mask * forward_flow_mask).bool()[0]
+    rgb = curr_frame[:, correspondence_mask].cpu().detach().numpy()[0] / 255.
 
     x1, x0 = correspondences_from_flow_mask(back_flow[0], correspondence_mask, args)
     x1, x2 = correspondences_from_flow_mask(forward_flow[0], correspondence_mask, args)
@@ -292,16 +305,21 @@ def reconstruct_3_frames(K, video, i, flow_model, args):
     x1 = x1.cpu().detach().numpy().astype(np.float32)
     x2 = x2.cpu().detach().numpy().astype(np.float32)
 
-    # Get Essential Matrix
-    F, _ = cv2.findFundamentalMat(x0, x1, method=cv2.FM_8POINT)
-    E = K.T @ F @ K
-    E = F_to_E(E)
-
     # Recover pose of first camera
-    _, R1, t1, mask = cv2.recoverPose(E, x0, x1, K)
+    if is_beginning:
+
+        # Get Essential Matrix
+        F, _ = cv2.findFundamentalMat(x0, x1, method=cv2.FM_8POINT)
+        E = K.T @ F @ K
+        E = F_to_E(E)
+
+        # Recover second camera poses
+        _, R1, t1, mask = cv2.recoverPose(E, x0, x1, K)
+        # R1 = R0 @ R1
+        # t1 = t0 + t1
 
     # Recover cameras:
-    P0 = K @ np.hstack((np.eye(3), np.zeros((3, 1))))  # First camera
+    P0 = K @ np.hstack((R0, t0))  # First camera
     P1 = K @ np.hstack((R1, t1)) 
 
     # Triangulate:
@@ -316,15 +334,16 @@ def reconstruct_3_frames(K, video, i, flow_model, args):
     # Get 3rd camera:
     ret, rvecs, tvecs = cv2.solvePnP(X3D, x2, K, None)
     R2 = cv2.Rodrigues(rvecs)[0]
-    t2 = tvecs[:, 0]
+    t2 = tvecs
 
     # Visualize:
     # geometries = visualized_3d_3frames(X3D, R1, t1[:, 0], R2, t2)
     # # o3d.visualization.draw_geometries(geometries, window_name="Reconstruction")
 
+    r0 = cv2.Rodrigues(R0)[0][:, 0]
     r1 = cv2.Rodrigues(R1)[0][:, 0]
     r2 = rvecs[:, 0]
-    global_opt = GlobalOptimization(K, x0, x1, x2, X3D, r1, r2, t1[:, 0], t2)
+    global_opt = GlobalOptimization(K, x0, x1, x2, X3D, r1, t1, r2, t2, r0, t0, cam1_requires_grad=is_beginning)
     global_opt.to(args.device)
     optimizer = torch.optim.AdamW(global_opt.parameters(), lr = args.lr)
 
@@ -343,7 +362,7 @@ def reconstruct_3_frames(K, video, i, flow_model, args):
 
     X, R1, R2, t1, t2 = global_opt.get_params()
 
-    return X, R1, R2, t1, t2
+    return X, R1, R2, t1, t2, rgb
 
     # # Visualize:
     # geometries = visualized_3d_3frames(X, R1, t1, R2, t2)

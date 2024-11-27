@@ -5,10 +5,10 @@ from flow_utils import read_video, load_flow_model, predict_flow, create_flow_he
 
 def main(args):
 
-    video = read_video(args)[15:35]          # video is of shape (frames, H, W, 3)
+    video = read_video(args)          # video is of shape (frames, H, W, 3)
     # video = video[20:30]
 
-    period = 3
+    period = 2
 
     model = load_flow_model(args)
     create_flow_heatmap(video, model, args, period)

@@ -264,30 +264,27 @@ def visualized_3d_2frames(X3D, R, t):
 
   return geometries
 
-def visualized_3d_3frames(X3D, R1, t1, R2, t2):
-
-  T1 = np.eye(4)
-  T1[:3, :3] = R1
-  T1[:3, 3] = t1
-  T2 = np.eye(4)
-  T2[:3, :3] = R2
-  T2[:3, 3] = t2
-
+def visualized_3d_3frames(X3D, camera_poses, rgb_):
   geometries = []
-  frame1 = o3d.geometry.TriangleMesh.create_coordinate_frame(size=2., origin=[0, 0, 0])
-  frame2 = o3d.geometry.TriangleMesh.create_coordinate_frame(size=2., origin=[0, 0, 0])
-  frame2.transform(T1.copy())
-  frame3 = o3d.geometry.TriangleMesh.create_coordinate_frame(size=2., origin=[0, 0, 0])
-  frame3.transform(T2.copy())
+  frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=2., origin=[0, 0, 0])
+  geometries.append(frame)
 
-  geometries.append(frame1)
-  geometries.append(frame2)
-  geometries.append(frame3)
+  for R, t in camera_poses:
+    T = np.eye(4)
+    T[:3, :3] = R
+    T[:3, 3,] = t.squeeze()
+    frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=2., origin=[0, 0, 0])
+    frame.transform(T.copy())
+    geometries.append(frame)
 
   pcd = np.zeros((X3D.shape[0], 3))
   pcd[:, :] = X3D[:, :]
+
+  rgb = np.zeros((X3D.shape[0], 3))
+  rgb[:, :] = rgb_
   pts_vis = o3d.geometry.PointCloud()
   pts_vis.points = o3d.utility.Vector3dVector(pcd)
+  pts_vis.colors = o3d.utility.Vector3dVector(rgb)
   geometries.append(pts_vis)
 
   return geometries
