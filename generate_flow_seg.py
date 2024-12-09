@@ -6,16 +6,12 @@ from flow_utils import read_video, load_flow_model, predict_flow, create_flow_he
 def main(args):
 
     video = read_video(args)          # video is of shape (frames, H, W, 3)
-    # video = video[20:30]
-
-    period = 2
+    # video = video[:10]
 
     model = load_flow_model(args)
-    create_flow_heatmap(video, model, args, period)
-    create_flow_mask_heatmap(video, model, args, period)
-    create_flow_correspondence_video(video, model, args, period)
-    # flow = predict_flow(video, model, args)
-    # video#.permute(0, 3, 1, 2)#.to(args.device)
+    create_flow_heatmap(video, model, args)
+    create_flow_mask_heatmap(video, model, args)
+    create_flow_correspondence_video(video, model, args)
     print("")
 
 if __name__ == '__main__':
@@ -27,6 +23,7 @@ if __name__ == '__main__':
     parser.add_argument('--video_path', help='relative file path of the video', type=str, default=None)
     parser.add_argument('--thresh', help='relative file path of the video', type=float, default=None)
     parser.add_argument('--batch', help='relative file path of the video', type=int, default=None)
+    parser.add_argument('--skip', help='relative file path of the video', type=int, default=None)
     args = parse_args(parser)
     
     main(args)

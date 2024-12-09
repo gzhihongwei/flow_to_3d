@@ -1,0 +1,935 @@
+"""
+This file contains the pybullet wrapper for the scene generation and object storage.
+"""
+import os
+import time
+
+import cv2
+import numpy as np
+import pybullet as p
+import pybullet_data
+import pybullet_utils.bullet_client as bc
+import yaml
+from scipy.spatial.transform import Rotation as R
+
+urdf_root_path = pybullet_data.getDataPath()
+
+COLORS = {
+    "blue": np.array([78, 121, 167]) / 255.0,  # blue
+    "green": np.array([89, 161, 79]) / 255.0,  # green
+    "brown": np.array([156, 117, 95]) / 255.0,  # brown
+    "orange": np.array([242, 142, 43]) / 255.0,  # orange
+    "yellow": np.array([237, 201, 72]) / 255.0,  # yellow
+    "gray": np.array([186, 176, 172]) / 255.0,  # gray
+    "red": np.array([255, 87, 89]) / 255.0,  # red
+    "purple": np.array([176, 122, 161]) / 255.0,  # purple
+    "cyan": np.array([118, 183, 178]) / 255.0,  # cyan
+    "pink": np.array([255, 157, 167]) / 255.0,
+}  
+
+class SceneCamera:
+    def __init__(self, client_id, cam_args):
+
+        self.client_id = client_id
+
+        self.mode = cam_args["mode"]  # or "position"
+        self.target = cam_args["target"]
+
+        # For distance mode:
+        self.distance = cam_args["distance"]
+        self.yaw = cam_args["yaw"]
+        self.pitch = cam_args["pitch"]
+        self.roll = cam_args["roll"]
+        self.up_axis_index = cam_args["up_axis_index"]
+
+        # For position mode:
+        self.eye = cam_args["eye"]
+        self.up_vec = cam_args["up_vec"]
+
+        # Intrinsics:
+        self.width = cam_args["width"]
+        self.height = cam_args["height"]
+        self.fov = cam_args["fov"]
+        self.near = cam_args["near"]
+        self.far = cam_args["far"]
+
+        # If camera is already saved somewhere:
+        self.view_matrix = cam_args["view_matrix"]
+        self.projection_matrix = cam_args["projection_matrix"]
+
+        self.quat = R.from_euler("xyz", [self.yaw, self.pitch, self.roll]).as_quat()
+        self.aspect = self.width / self.height
+
+        # Define Intrinsics:
+        self.f = 1 / np.tan(self.fov/2 * (np.pi / 180))
+        # self.scale = (2 * self.near * self.far) / (self.near - self.far)
+        self.K = np.array([[self.f, 0., self.width / 2],
+                           [0., self.f, self.height / 2],
+                           [0., 0., 1.]])
+
+        if (self.view_matrix is None) or (self.view_matrix == "None"):
+            if self.mode == "distance":
+                self.view_matrix = self.client_id.computeViewMatrixFromYawPitchRoll(
+                    self.target,
+                    self.distance,
+                    self.yaw,
+                    self.pitch,
+                    self.roll,
+                    self.up_axis_index,
+                )
+            elif self.mode == "position":
+                self.view_matrix = self.client_id.computeViewMatrix(
+                    self.eye, self.target, self.up_vec
+                )
+
+        if (self.projection_matrix is None) or (self.projection_matrix == "None"):
+            self.projection_matrix = self.client_id.computeProjectionMatrixFOV(
+                self.fov, self.aspect, self.near, self.far
+            )
+
+    def capture(self):
+        _, _, rgb, depth, segs = self.client_id.getCameraImage(
+            self.width,
+            self.height,
+            self.view_matrix,
+            self.projection_matrix,
+        )
+
+        rgb = np.reshape(rgb, (self.width, self.height, 4))
+        rgb = rgb[..., :3]
+
+        depth = np.reshape(depth, (self.width, self.height))
+
+        return rgb, depth, segs
+
+    def get_pointcloud(self, depth, seg_img=None):
+        """Returns a point cloud and its segmentation from the given depth image
+
+        Args:
+        -----
+            depth (np.array): depth image
+            width (int): width of the image
+            height (int): height of the image
+            view_matrix (np.array): 4x4 view matrix
+            proj_matrix (np.array): 4x4 projection matrix
+            seg_img (np.array): segmentation image
+
+        Return:
+        -------
+            pcd (np.array): Nx3 point cloud
+            pcd_seg (np.array): N array, segmentation of the point cloud
+        """
+        # based on https://stackoverflow.com/questions/59128880/getting-world-coordinates-from-opengl-depth-buffer
+
+        # create a 4x4 transform matrix that goes from pixel coordinates (and depth values) to world coordinates
+        proj_matrix = np.asarray(self.projection_matrix).reshape([4, 4], order="F")
+        view_matrix = np.asarray(self.view_matrix).reshape([4, 4], order="F")
+        tran_pix_world = np.linalg.inv(
+            np.matmul(proj_matrix, view_matrix)
+        )  # Pixel to 3D transformation
+
+        # create a mesh grid with pixel coordinates, by converting 0 to width and 0 to height to -1 to 1
+        y, x = np.mgrid[-1 : 1 : 2 / self.height, -1 : 1 : 2 / self.width]
+        y *= -1.0  # y is reversed in pixel coordinates
+
+        # Reshape to single dimension arrays
+        x, y, z = x.reshape(-1), y.reshape(-1), depth.reshape(-1)
+
+        # Homogenize:
+        pixels = np.stack([x, y, z, np.ones_like(z)], axis=1)
+        # filter out "infinite" depths:
+        fin_depths = np.where(z < 0.99)
+        pixels = pixels[fin_depths]
+
+        # Depth z is between 0 to 1, so convert it to -1 to 1.
+        pixels[:, 2] = 2 * pixels[:, 2] - 1
+
+        if seg_img is not None:
+            seg_img = np.array(seg_img)
+            pcd_seg = seg_img.reshape(-1)[fin_depths]  # filter out "infinite" depths
+        else:
+            pcd_seg = None
+
+        # turn pixels to world coordinates
+        points = np.matmul(tran_pix_world, pixels.T).T
+        points /= points[:, 3:4]  # Homogenize in 3D
+        points = points[:, :3]  # Remove last axis ones
+
+        return points, pcd_seg, fin_depths
+
+
+class Scene:
+    def __init__(
+        self,
+        args,
+        seed=None,
+        gui=True,
+        timestep=1 / 480,
+    ):
+        self.seed = seed
+        self.args = args
+        self.max_control_iters = self.args["max_control_iters"]
+        self.stability_iters = self.args["stability_iters"]
+        self.tol = self.args["tolerance"]
+        self.max_frames = self.args["max_frames"]
+
+        self.config_path = (
+            self.args["scene_config_folder"] + self.args["scene"] + ".yaml"
+        )
+        assert os.path.isfile(
+            self.config_path
+        ), f"Error: {self.config_path} is not a file or does not exist! Check your configs"
+
+        with open(self.config_path, "r") as file:
+            self.config = yaml.load(file, Loader=yaml.FullLoader)
+
+        self.client_id = bc.BulletClient(
+            p.GUI if gui else p.DIRECT
+        )  # Initialize the bullet client
+
+        self.client_id.setAdditionalSearchPath(
+            pybullet_data.getDataPath()
+        )  # Add pybullet's data package to path
+        self.client_id.setTimeStep(timestep)  # Set simulation timestep
+        # self.client_id.configureDebugVisualizer(
+        #     p.COV_ENABLE_SHADOWS, 1
+        # )  # Enable Shadows
+        self.client_id.configureDebugVisualizer(
+            p.COV_ENABLE_GUI, 0
+        )  # Disable Frame Axes
+
+        self.client_id.resetSimulation()
+        self.client_id.setGravity(0, 0, -9.8)  # Set Gravity
+
+        self.plane = self.client_id.loadURDF(
+            "plane.urdf", basePosition=(0, 0, 0), useFixedBase=True
+        )  # Load a floor
+
+        self.load_objects()
+
+        # Setup Camera:
+        self.camera_list = []
+        cam_args = self.config["camera"]
+        # for i, cam_args in self.config["camera"].items():
+        self.cam = SceneCamera(self.client_id, cam_args)
+            # self.camera_list.append(cam)
+
+        print("Loading Perception Modules")
+        self.prev_press = -1
+        self.num_pressed = 1
+        self.current_focus = 0
+
+        self.prev_keys = {}
+
+        self.start_state = self.client_id.saveState()
+
+        self.wait_for_stability()
+
+        # self.gsam = grounded_sam()
+
+    def reset(self):
+
+        self.client_id.restoreState(stateId = self.start_state)
+
+    def load_objects(self):
+        assert "objects" in self.config, "Error: No objects in the config file"
+
+        self.objects = {}
+        self.grasp_obj_names = []
+        self.grasp_obj_ids = []
+        self.fixed_obj_ids = []
+        for obj_name, obj in self.config["objects"].items():
+            obj_path = self.args["objects_folder"] + obj["file"]
+            obj_id = self.client_id.loadURDF(
+                obj_path,
+                obj["pos"],
+                obj["orn"],
+                useFixedBase=obj["fixed_base"],
+                globalScaling=obj["scale"],
+            )
+            self.objects[obj_name] = obj_id
+            if not obj["fixed_base"]:
+                self.grasp_obj_names.append(obj_name)
+                self.grasp_obj_ids.append(obj_id)
+                # self.client_id.changeDynamics(obj_id, -1, lateralFriction=10000.)
+            else:
+                self.fixed_obj_ids.append(obj_id)
+
+        self.num_objs = len(self.grasp_obj_ids)
+        self.controlled_obj = 0
+        self.controlled_obj_name = self.grasp_obj_names[self.controlled_obj]
+
+        print("Currently controlling: " + self.controlled_obj_name)
+
+        # !!! You also need to add functionality for articulations and constraints, which I am skipping for now
+
+    def move_object(self, obj_id, force_pt, force_vec, vid_path):
+
+        pose = self.get_object_pose(obj_id)
+        # obj_trans = self.pose_to_transformation(pose)
+        # obj_frame = self.draw_frame(obj_trans)
+
+        # force_pose = pose.copy()
+        # force_pose[:3] = force_pose[:3] + force_pt
+        # obj_frame = self.draw_frame(obj_trans)
+
+        # self.client_id.applyExternalForce(obj_id, -1, force_vec, force_pt, p.LINK_FRAME)
+        self.client_id.applyExternalTorque(obj_id, -1, force_vec, p.LINK_FRAME)
+
+        self.record_motion(vid_path)
+        # for _ in range(self.stability_iters):
+        #     self.client_id.stepSimulation()
+
+        print("")
+    
+    def control_objects(self):
+        self.controlled_obj_name = self.grasp_obj_names[self.controlled_obj]
+        pose = self.get_object_pose(self.controlled_obj_name)
+        pos = pose[:3]
+        euler = np.array(p.getEulerFromQuaternion(pose[3:]))
+
+        keys = self.client_id.getKeyboardEvents()
+
+        left, right = p.B3G_LEFT_ARROW, p.B3G_RIGHT_ARROW
+        up, down = p.B3G_UP_ARROW, p.B3G_DOWN_ARROW
+        front, back = ord("-"), ord("=")
+
+        roll_in, roll_out = ord("["), ord("]")
+        pitch_in, pitch_out = ord(";"), ord("'")
+        yaw_in, yaw_out = ord(","), ord(".")
+
+        focus = ord("/")
+        drop = p.B3G_RETURN
+
+        step = 0.00001
+        angle_step = 0.00001
+
+        # Positive X
+        if front in keys:
+            pos[0] = pos[0] + step
+        # Negative X
+        if back in keys:
+            pos[0] = pos[0] - step
+
+        # Positive Y
+        if left in keys:
+            pos[1] = pos[1] + step
+        # Negative Y
+        if right in keys:
+            pos[1] = pos[1] - step
+
+        # Positive Z
+        if up in keys:
+            pos[2] = pos[2] + step
+        # Negative Z
+        if down in keys:
+            pos[2] = pos[2] - step
+
+        # Roll:
+        if roll_out in keys:
+            euler[0] = euler[0] + angle_step
+        if roll_in in keys:
+            euler[0] = euler[0] - angle_step
+
+        # Pitch
+        if pitch_out in keys:
+            euler[1] = euler[1] + angle_step
+        if pitch_in in keys:
+            euler[1] = euler[1] - angle_step
+
+        # Yaw
+        if yaw_out in keys:
+            euler[2] = euler[2] + angle_step
+        if yaw_in in keys:
+            euler[2] = euler[2] - angle_step
+
+        # Switch Focus
+        if (focus in self.prev_keys) and (len(keys) == 0):
+            self.controlled_obj = (self.controlled_obj + 1) % self.num_objs
+            self.controlled_obj_name = self.grasp_obj_names[self.controlled_obj]
+            print("Currently controlling: " + self.controlled_obj_name)
+            self.prev_keys = keys.copy()
+            return 0
+
+        # Drop object:
+        if (drop in self.prev_keys) and (len(keys) == 0):
+            self.wait_for_stability()
+            self.prev_keys = keys.copy()
+            return self.objects[self.controlled_obj_name]
+
+        self.prev_keys = keys.copy()
+
+        orn = p.getQuaternionFromEuler(euler)
+        self.client_id.resetBasePositionAndOrientation(
+            self.objects[self.controlled_obj_name], pos, orn
+        )
+
+        return 0
+
+    def control_view(self):
+        view_cam = self.client_id.getDebugVisualizerCamera()
+        yaw, pitch, dist, target = (
+            view_cam[8],
+            view_cam[9],
+            view_cam[10],
+            np.array(view_cam[11]),
+        )
+
+        keys = self.client_id.getKeyboardEvents()
+        left, right = p.B3G_LEFT_ARROW, p.B3G_RIGHT_ARROW
+        up, down = p.B3G_UP_ARROW, p.B3G_DOWN_ARROW
+        zoom_in, zoom_out = ord("."), ord(",")
+        focus = ord("/")
+
+        if (len(keys) > 0) and (self.prev_press == p.KEY_IS_DOWN):
+            self.num_pressed += 1
+        else:
+            self.num_pressed = 1
+
+        # Yaw Left
+        if (left in keys) and (
+            keys[left] == p.KEY_IS_DOWN or keys[left] == p.KEY_WAS_TRIGGERED
+        ):
+            yaw = yaw - 0.1 * self.num_pressed
+            self.prev_press = keys[left]
+        # Yaw Right
+        if (right in keys) and (
+            keys[right] == p.KEY_IS_DOWN or keys[right] == p.KEY_WAS_TRIGGERED
+        ):
+            yaw = yaw + 0.1 * self.num_pressed
+            self.prev_press = keys[right]
+        # Pitch Up
+        if (up in keys) and (
+            keys[up] == p.KEY_IS_DOWN or keys[up] == p.KEY_WAS_TRIGGERED
+        ):
+            pitch = pitch - 0.1 * self.num_pressed
+            self.prev_press = keys[up]
+        # Pitch Down
+        if (down in keys) and (
+            keys[down] == p.KEY_IS_DOWN or keys[down] == p.KEY_WAS_TRIGGERED
+        ):
+            pitch = pitch + 0.1 * self.num_pressed
+            self.prev_press = keys[down]
+
+        # Zoom in:
+        if (zoom_in in keys) and (
+            keys[zoom_in] == p.KEY_IS_DOWN or keys[zoom_in] == p.KEY_WAS_TRIGGERED
+        ):
+            dist = dist - 0.01 * self.num_pressed
+            self.prev_press = keys[zoom_in]
+        # Zoom out:
+        if (zoom_out in keys) and (
+            keys[zoom_out] == p.KEY_IS_DOWN or keys[zoom_out] == p.KEY_WAS_TRIGGERED
+        ):
+            dist = dist + 0.01 * self.num_pressed
+            self.prev_press = keys[zoom_out]
+
+        # Switch Focus
+        if (focus in keys) and (keys[focus] == p.KEY_IS_DOWN):
+            self.current_focus = (self.current_focus + 1) % self.num_objs
+            self.prev_press = keys[focus]
+
+        target = self.get_object_pose(self.grasp_obj_names[self.current_focus])[:3]
+
+        self.client_id.resetDebugVisualizerCamera(dist, yaw, pitch, target)
+
+    def go_to_position(self, joints):
+        self.client_id.setJointMotorControlArray(
+            self.robot_id,
+            jointIndices=self.joints,
+            controlMode=p.POSITION_CONTROL,
+            targetPositions=joints,
+        )
+
+        for _ in range(self.max_control_iters):
+            self.client_id.stepSimulation()
+            # time.sleep(0.001)
+            joint_pos = self.get_joint_pos()
+            error = np.abs(joints - joint_pos)
+            if np.all(error < self.tol):
+                break
+
+    def execute_path(self, path):
+        for i in range(path.shape[0]):
+            self.go_to_position(path[i])
+
+    def actuate_gripper(self, gripper_joints):
+        self.client_id.setJointMotorControlArray(
+            self.robot_id,
+            jointIndices=self.gripper_joints,
+            controlMode=p.POSITION_CONTROL,
+            targetPositions=gripper_joints,
+            forces=[5., 5.],  # Max grasp force
+        )
+
+        for _ in range(self.max_control_iters):
+            self.client_id.stepSimulation()
+            time.sleep(0.01)
+            gripper_pos = self.get_gripper_pos()
+            error = np.abs(gripper_joints - gripper_pos)
+            if np.all(error < self.tol):
+                break
+
+    def open_gripper(self):
+        self.actuate_gripper(self.gripper_upper_limits)
+
+    def close_gripper(self, obj_id):
+        # self.actuate_gripper(self.gripper_lower_limits)
+        # self.client_id.setJointMotorControlArray(
+        #     self.robot_id,
+        #     jointIndices=self.gripper_joints,
+        #     controlMode=p.VELOCITY_CONTROL,
+        #     targetVelocities=[-0.00001, -0.00001],
+        #     forces=[0.5, 0.5],  # Max grasp force
+        # )
+        self.client_id.setJointMotorControlArray(
+            self.robot_id,
+            jointIndices=self.gripper_joints,
+            controlMode=p.POSITION_CONTROL,
+            targetPositions=self.gripper_lower_limits,
+            forces=[5., 5.],  # Max grasp force
+        )
+
+        # x = self.client_id.getContactPoints(self.robot_id, obj_id, self.left_finger, -1)
+
+        for _ in range(self.max_control_iters):
+            self.client_id.stepSimulation()
+            # time.sleep(0.01)
+            # gripper_vel = self.get_gripper_vel()
+
+            left_contact = len(self.client_id.getContactPoints(self.robot_id, obj_id, self.left_finger, -1)) > 0
+            right_contact = len(self.client_id.getContactPoints(self.robot_id, obj_id, self.right_finger, -1)) > 0
+
+            # error = np.abs(gripper_vel)
+            if left_contact and right_contact:
+                print("Contact detected")
+                for _ in range(self.max_control_iters):
+                    time.sleep(0.01)
+                    gripper_vel = self.get_gripper_vel()
+                    error = np.abs(gripper_vel)
+                    if np.all(error < self.tol):
+                        break
+                print("Gripper stopped")
+                break
+
+    def stabilize_gripper(self):
+        curr_gripper = self.get_gripper_pos()
+        # self.client_id.setJointMotorControlArray(
+        #     self.robot_id,
+        #     jointIndices=self.gripper_joints,
+        #     controlMode=p.VELOCITY_CONTROL,
+        #     targetPositions=curr_gripper,
+        #     targetVelocities=[0., 0.],
+        #     forces=[.05, .05],  # Max grasp force
+        # )
+
+        self.client_id.resetJointState(
+            self.robot_id, self.gripper_joints, curr_gripper, [0.0, 0.0]
+        )
+
+    def record_motion(self, vid_path):
+
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        fps = 30
+        writer = cv2.VideoWriter(vid_path, fourcc, fps, (self.cam.width, self.cam.height))
+
+        for _ in range(self.max_frames):
+            self.client_id.stepSimulation()
+            cam_rgb, _, _ = self.cam.capture()
+            cam_rgb = cv2.cvtColor(cam_rgb, cv2.COLOR_BGR2RGB)
+            writer.write(cam_rgb)
+            # time.sleep(0.01)
+            obj_vels = np.zeros((self.num_objs, 6))
+            for i in range(self.num_objs):
+                obj_vels[i] = self.get_object_vel(self.grasp_obj_names[i])
+
+            error = np.abs(obj_vels)
+            if np.all(error < self.tol):
+                break
+
+        writer.release()
+
+    
+    def wait_for_stability(self):
+        for _ in range(self.stability_iters):
+            self.client_id.stepSimulation()
+            time.sleep(0.01)
+            obj_vels = np.zeros((self.num_objs, 6))
+            for i in range(self.num_objs):
+                obj_vels[i] = self.get_object_vel(self.grasp_obj_names[i])
+
+            error = np.abs(obj_vels)
+            if np.all(error < self.tol):
+                break
+
+    def get_joint_pos(self):
+        states = self.client_id.getJointStates(self.robot_id, self.joints)
+        pos = np.zeros(
+            (
+                len(
+                    self.joints,
+                )
+            )
+        )
+        for i in range(len(states)):
+            pos[i] = states[i][0]
+
+        return np.array(pos)
+
+    def get_gripper_pos(self):
+        states = self.client_id.getJointStates(self.robot_id, self.gripper_joints)
+        pos = np.zeros(
+            (
+                len(
+                    self.gripper_joints,
+                )
+            )
+        )
+        for i in range(len(states)):
+            pos[i] = states[i][0]
+
+        return np.array(pos)
+
+    def get_gripper_vel(self):
+        states = self.client_id.getJointStates(self.robot_id, self.gripper_joints)
+        vel = np.zeros(
+            (
+                len(
+                    self.gripper_joints,
+                )
+            )
+        )
+        for i in range(len(states)):
+            vel[i] = states[i][1]
+
+        return np.array(vel)
+
+    def get_object_pose(self, obj_name):
+        if type(obj_name) == int:  # If it is object id
+            pose = self.client_id.getBasePositionAndOrientation(obj_name)
+        else:
+            pose = self.client_id.getBasePositionAndOrientation(self.objects[obj_name])
+        return np.array([*pose[0], *pose[1]])
+
+    def get_object_vel(self, obj_name):
+        vel = self.client_id.getBaseVelocity(self.objects[obj_name])
+        return np.array([*vel[0], *vel[1]])
+
+    def combine_poses(self, pose_list):
+        """
+        Order of the list is the order in which it will be applied
+        """
+
+        T = np.eye(4)
+        for pose in pose_list:
+            T = T @ self.pose_to_transformation(pose)
+
+        final_pose = self.transformation_to_pose(T)
+
+        return final_pose
+
+    def inverse_kinematics(self, pose):
+        curr_joints = self.get_joint_pos()
+
+        info = PANDA_INFO
+        check_ik_solver(info)
+        pose = (
+            tuple(pose[:3]),
+            tuple(pose[3:]),
+        )  # Here quaternion has to be in x,y,z,w
+        all_solns = np.array(
+            list(
+                either_inverse_kinematics(
+                    self.robot_id,
+                    info,
+                    self.end_effector,
+                    pose,
+                    max_attempts=1000,
+                    max_time=1000,
+                )
+            )
+        )
+        error = np.max(
+            np.abs(all_solns - curr_joints[np.newaxis, :])
+            * self.work_ratio[np.newaxis, :],
+            axis=1,
+        )
+        best_index = np.argmin(error)  # Take the best min(max()) score
+        best_soln = all_solns[best_index]
+
+        return best_soln
+
+    def auto_grasp_nearest(self):
+        gripper_position = self.get_end_effector_pose()[
+            np.newaxis, :3
+        ]  # Expand so I can subtract later with equal dimensions
+        obj_positions = np.zeros((self.num_objs, 3))
+
+        for i in range(self.num_objs):
+            obj_positions[i] = self.get_object_pose(self.grasp_obj_names[i])[
+                :3
+            ]  # This is in x,y,z,w
+
+        error = np.sqrt(np.sum((obj_positions - gripper_position) ** 2, axis=1))
+        nearest_obj_index = np.argmin(error)
+        nearest_obj = self.grasp_obj_names[nearest_obj_index]
+
+        obj_id = self.objects[
+            nearest_obj
+        ]  # For articulated objects, this has to be changed to a base link and a child link !!!
+        object_pose = self.get_object_pose(nearest_obj)
+        relative_grasp_pose = self.object_grasps[nearest_obj]
+
+        # Initial grasp pose
+        grasp_pose = self.combine_poses([object_pose, relative_grasp_pose])
+        grasp_joints = self.inverse_kinematics(
+            grasp_pose
+        )  # This automatically gives the nearest IK solution to the current joint state
+
+        tr = self.pose_to_transformation(grasp_pose)
+        self.draw_frame(tr)
+
+        self.go_to_position(grasp_joints)
+        self.grasp(obj_id)
+
+    def get_grasp_pose(self, obj):
+        object_pose = self.get_object_pose(obj)
+        relative_grasp_pose = self.object_grasps[obj]
+        grasp_pose = self.combine_poses([object_pose, relative_grasp_pose])
+
+        return grasp_pose
+
+    def grasp(self, obj_id):
+        curr_pose = self.get_end_effector_pose()
+        curr_joints = self.get_joint_pos()
+
+        # Ending grasp pose
+        grasp_action = np.zeros((7,))
+        grasp_action[2] = self.grasp_depth
+        grasp_action[-1] = 1
+        grasp_end_pose = self.combine_poses([curr_pose, grasp_action])
+
+        # tr = self.pose_to_transformation(self.get_end_effector_pose())
+        # self.draw_frame(tr)
+
+        grasp_end_joints = self.inverse_kinematics(grasp_end_pose)
+
+        # other_constraints = []
+        # prev_masses = {}
+        # for other_obj in self.grasp_obj_ids:
+        #     if other_obj != obj_id:
+        #         # other_pose = self.get_object_pose(other_obj)
+
+        #         # cons = self.client_id.createConstraint(
+        #         #     0,
+        #         #     -1,
+        #         #     other_obj,
+        #         #     -1,
+        #         #     p.JOINT_FIXED,
+        #         #     [0.0, 0.0, 0],
+        #         #     other_pose[:3],
+        #         #     other_pose[:3],
+        #         #     other_pose[3:]
+        #         # )
+        #         # other_constraints.append(cons)
+        #         prev_mass = self.client_id.getDynamicsInfo(other_obj, -1)[0]
+        #         self.client_id.changeDynamics(other_obj, -1, mass=0)
+        #         prev_masses[other_obj] = prev_mass
+
+        # Open gripper:
+        self.open_gripper()
+
+        # Actuate forward:
+        # self.go_to_position(grasp_end_joints)
+
+        grasp_path = np.linspace(curr_joints, grasp_end_joints, num=80)
+        self.execute_path(grasp_path)
+
+        # Grasp:
+        self.close_gripper(obj_id)
+        # self.stabilize_gripper()
+
+        # self.grasp_constraint = self.client_id.createConstraint(
+        #     self.robot_id,
+        #     self.end_effector,
+        #     obj_id,
+        #     -1,
+        #     p.JOINT_FIXED,
+        #     [0.0, 0.0, 1.0],
+        #     [0.0, 0.0, 0.0],
+        #     [0.0, 0.0, 0.0],
+        # )
+
+        self.grasped_obj = obj_id
+        self.is_grasped = True
+
+        # self.go_to_position(curr_joints)
+
+        # for cons in other_constraints:
+        #     self.client_id.removeConstraint(cons)
+
+        # self.wait_for_stability()
+
+        retract_path = np.linspace(grasp_end_joints, curr_joints, num=80)
+        self.execute_path(retract_path)
+
+        # self.grasp_constraint = self.client_id.createConstraint(
+        #     self.robot_id,
+        #     self.end_effector,
+        #     obj_id,
+        #     -1,
+        #     p.JOINT_FIXED,
+        #     [0.0, 0.0, 1.0],
+        #     [0.0, 0.0, 0.0],
+        #     [0.0, 0.0, 0.0],
+        # )
+
+        # for other_obj in self.grasp_obj_ids:
+        #     if other_obj != obj_id:
+        #         self.client_id.changeDynamics(
+        #             other_obj, -1, mass=prev_masses[other_obj]
+        #         )
+
+        print("")
+
+    def drop(self):
+        if self.is_grasped:# and (self.grasp_constraint is not None):
+            # self.client_id.removeConstraint(self.grasp_constraint)
+            self.open_gripper()
+            self.wait_for_stability()
+            self.actuate_gripper(self.gripper_lower_limits)
+
+            # self.grasp_constraint = None
+            self.is_grasped = False
+
+            self.drops += 1
+
+    def save_img_and_seg(self):
+        for i in range(len(self.camera_list)):
+            cam = self.camera_list[i]
+            cam_rgb, cam_depth = cam.capture()
+            cam_pcd, cam_pcd_seg, cam_pcd_ind = cam.get_pointcloud(cam_depth)
+
+            r = np.max(cam_depth) - np.min(cam_depth)
+            m = np.min(cam_depth)
+            cam_depth = np.round((255 / r) * (cam_depth - m)).astype(np.uint8)
+
+            cv2.imwrite(
+                "vis/Camera_" + str(i + 1) + "RGB_" + str(self.drops + 1) + ".jpg",
+                cv2.cvtColor(cam_rgb, cv2.COLOR_BGR2RGB),
+            )
+            cv2.imwrite(
+                "vis/Camera_" + str(i + 1) + "Depth_" + str(self.drops + 1) + ".jpg",
+                cam_depth,
+            )
+            # cv2.imwrite("vis/Camera_" + str(i+1) + "Seg_" + str(self.drops+1) + ".jpg", cam_pcd_seg)
+
+        pcd, rgb = self.get_fused_pcd()
+        np.save("vis/pcd_" + str(self.drops) + ".npy", pcd)
+        np.save("vis/pcd_rgb_" + str(self.drops) + ".npy", rgb)
+
+    def get_fused_pcd(self):
+        rgbs = []
+        pcds = []
+        pcd_segs = []
+
+        for i in range(len(self.camera_list)):
+            cam = self.camera_list[i]
+            cam_rgb, cam_depth, cam_seg = cam.capture()
+            cam_pcd, cam_pcd_seg, cam_pcd_ind = cam.get_pointcloud(cam_depth, cam_seg)
+            rgbs.append(cam_rgb.reshape(-1, 3)[cam_pcd_ind])
+            pcds.append(cam_pcd)
+            pcd_segs.append(cam_pcd_seg)
+
+        pcd = np.concatenate(pcds, axis=0)  # Fuse point clouds by simply stacking them
+        rgb = np.concatenate(rgbs, axis=0)  # Optionally, get colors for each point
+        pcd_segs = np.concatenate(pcd_segs, axis=0)
+
+        return pcd, pcd_segs, rgb
+
+    def get_end_effector_pose(self):
+        pos, ori = self.client_id.getLinkState(
+            self.robot_id, self.end_effector, computeForwardKinematics=1
+        )[:2]
+        pose = np.array([*pos, *ori])
+
+        return pose
+
+    def plan_motion(self):
+        pass
+
+    def quaternion_to_rotation_matrix(self, quat):
+        """
+        Convert a quaternion to a rotation matrix.
+
+        :param q: Quaternion [w, x, y, z]
+        :return: 3x3 rotation matrix
+        """
+        # w, x, y, z = quat
+        # rotation_matrix = np.array([[1 - 2*y**2 - 2*z**2,  2*x*y - 2*z*w,        2*x*z + 2*y*w],
+        #                             [2*x*y + 2*z*w,        1 - 2*x**2 - 2*z**2,  2*y*z - 2*x*w],
+        #                             [2*x*z - 2*y*w,        2*y*z + 2*x*w,        1 - 2*x**2 - 2*y**2]])
+
+        mat = np.array(self.client_id.getMatrixFromQuaternion(quat))
+        rotation_matrix = np.reshape(mat, (3, 3))
+
+        return rotation_matrix
+
+    def pose_to_transformation(self, pose):
+        pos = pose[:3]
+        quat = pose[3:]
+
+        rotation_matrix = self.quaternion_to_rotation_matrix(quat)
+
+        transform = np.zeros((4, 4))
+        transform[:3, :3] = rotation_matrix.copy()
+        transform[:3, 3] = pos.copy()
+        transform[3, 3] = 1
+
+        return transform
+
+    def transformation_to_pose(self, T):
+        trans = T[:3, 3]  # Extract translation (3x1 vector)
+        rot = T[:3, :3]  # Extract rotation (3x3 matrix)
+        quat = R.from_matrix(rot).as_quat()  # Convert to quaternion (w, x, y, z)
+
+        pose = np.append(trans, quat)
+
+        return pose
+
+    def forward_kinematics(self, joint_angles):
+        T_EE = np.identity(4)
+        for i in range(7 + 3):
+            T_EE = T_EE @ self.get_tf_mat(i, joint_angles)
+
+        return T_EE
+
+    def draw_frame(self, transform, scale_factor=0.2):
+        unit_axes_world = np.array(
+            [
+                [scale_factor, 0, 0],
+                [0, scale_factor, 0],
+                [0, 0, scale_factor],
+                [1, 1, 1],
+            ]
+        )
+        axis_points = ((transform @ unit_axes_world)[:3, :]).T
+        axis_center = transform[:3, 3]
+
+        l1 = self.client_id.addUserDebugLine(
+            axis_center, axis_points[0], COLORS["red"], lineWidth=4
+        )
+        l2 = self.client_id.addUserDebugLine(
+            axis_center, axis_points[1], COLORS["green"], lineWidth=4
+        )
+        l3 = self.client_id.addUserDebugLine(
+            axis_center, axis_points[2], COLORS["blue"], lineWidth=4
+        )
+
+        frame_id = [l1, l2, l3]
+
+        return frame_id[:]
+
+    def remove_frame(self, frame_id):
+        for id in frame_id:
+            self.client_id.removeUserDebugItem(id)

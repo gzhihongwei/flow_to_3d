@@ -49,15 +49,15 @@ def calc_flow(args, model, image1, image2):
   info_down = F.interpolate(info, scale_factor=0.5 ** args.scale, mode='area')
   return flow_down, info_down
 
-def predict_flow(video, model, args, period = 1):
+def predict_flow(video, model, args):
   """
   video => torch tensor of shape (frames, H, W, 3)
   """
 
   vid_input = torch.permute(video, (0, 3, 1, 2))    # Now vid_input is (frames, 3, H, W)   (0, 2, 3, 1)
 
-  frame1 = vid_input[:-period]
-  frame2 = vid_input[period:]
+  frame1 = vid_input[:-args.skip]
+  frame2 = vid_input[args.skip:]
 
   flow, _ = calc_flow(args, model, frame1, frame2)    # Flow is predicted in (frames, 2, H, W)
   flow = torch.permute(flow, (0, 2, 3, 1))            # Now flow is (frames, H, W, 2)
@@ -76,7 +76,7 @@ def predict_flow_images(image1, image2, model, args):
 
   return flow
 
-def create_flow_heatmap(video, model, args, period = 1):
+def create_flow_heatmap(video, model, args):
   """
   flow => torch tensor of shape (frames, H, W, 2)
   """
@@ -98,7 +98,7 @@ def create_flow_heatmap(video, model, args, period = 1):
   print("Creating Heatmap:")
   for i in tqdm(range(num_batches)):
 
-    flow = predict_flow(video[(i * args.batch) : ((i+1) * args.batch)], model, args, period)
+    flow = predict_flow(video[(i * args.batch) : ((i+1) * args.batch)], model, args)
     
     for j in range(flow.shape[0]):
       
@@ -108,7 +108,7 @@ def create_flow_heatmap(video, model, args, period = 1):
   cap.release()
   writer.release()
 
-def create_flow_mask_heatmap(video, model, args, period = 1):
+def create_flow_mask_heatmap(video, model, args):
   """
   flow => torch tensor of shape (frames, H, W, 2)
   """
@@ -130,7 +130,7 @@ def create_flow_mask_heatmap(video, model, args, period = 1):
   print("Creating Heatmap:")
   for i in tqdm(range(num_batches)):
 
-    flow = predict_flow(video[(i * args.batch) : ((i+1) * args.batch)], model, args, period)
+    flow = predict_flow(video[(i * args.batch) : ((i+1) * args.batch)], model, args)
     flow_mask = create_flow_mask(flow, args)    # flow_mask is (frames, H, W)
     masked_flow = flow * flow_mask.unsqueeze(-1).float()
     
@@ -142,7 +142,7 @@ def create_flow_mask_heatmap(video, model, args, period = 1):
   cap.release()
   writer.release()
 
-def create_flow_correspondence_video(video, model, args, period = 1):
+def create_flow_correspondence_video(video, model, args):
   """
   flow => torch tensor of shape (frames, H, W, 2)
   """
@@ -164,7 +164,7 @@ def create_flow_correspondence_video(video, model, args, period = 1):
   print("Creating Heatmap:")
   for i in tqdm(range(num_batches)):
 
-    flow = predict_flow(video[(i * args.batch) : ((i+1) * args.batch)], model, args, period)
+    flow = predict_flow(video[(i * args.batch) : ((i+1) * args.batch)], model, args)
     
     for j in range(flow.shape[0]):
 

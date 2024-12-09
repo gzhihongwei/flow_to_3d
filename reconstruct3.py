@@ -12,16 +12,17 @@ from views3 import reconstruct_3_frames, invert_similarity_transform, homogenize
 
 def main(args):
 
-    video = read_video(args)[10:25]
+    video = read_video(args)[:6]
     print("")
 
     flow_model = load_flow_model(args)
 
     # Assuming known intrinsics
-    K = np.load("assets/intrinsics.npy").astype(np.float32)
-    K /= 2.08
-    K[:2, 2] = K[:2, 2][::-1]
-    K[-1, -1] = 1.
+    K = np.load("assets/sim_intrinsics.npy").astype(np.float32)
+    # K /= 2.08
+    # K[:2, 2] = K[:2, 2][::-1]
+    # K[:2, 2] = 1024.
+    # K[-1, -1] = 1.
 
     frame_inds = range(0, len(video) - 4, 2)
 
