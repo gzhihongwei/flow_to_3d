@@ -12,19 +12,19 @@ from views3 import reconstruct_3_frames, invert_similarity_transform, homogenize
 
 def main(args):
 
-    video = read_video(args)[:6]
+    video = read_video(args)[10:22]
     print("")
 
     flow_model = load_flow_model(args)
 
     # Assuming known intrinsics
-    K = np.load("assets/sim_intrinsics.npy").astype(np.float32)
-    # K /= 2.08
-    # K[:2, 2] = K[:2, 2][::-1]
-    # K[:2, 2] = 1024.
-    # K[-1, -1] = 1.
+    K = np.load("assets/intrinsics.npy").astype(np.float32)
+    K /= 2.08
+    K[:2, 2] = K[:2, 2][::-1]
+    K[:2, 2] = 1024.
+    K[-1, -1] = 1.
 
-    frame_inds = range(0, len(video) - 4, 2)
+    frame_inds = range(0, len(video) - 2*args.skip, args.skip)
 
     X_all = []
     # T_all = [np.eye(4)]
@@ -46,6 +46,8 @@ def main(args):
         camera_all.append((R1_, t1_))
         R0, t0 = R1_.copy(), t1_.copy()
         R1, t1 = R2.copy(), t2.copy()
+        geometries = visualized_3d_3frames(np.concatenate(X_all, axis=0), camera_all, np.concatenate(rgb_all, axis=0))
+        o3d.visualization.draw_geometries(geometries, window_name="Reconstruction")
         # T_all.append(T @ T_all[-1])
         # R1_all.append(R1)
         # t1_all.append(t1)

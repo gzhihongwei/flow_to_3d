@@ -282,6 +282,13 @@ def reconstruct_3_frames(K, R0, t0, video, i, flow_model, args, R1 = None, t1 = 
     curr_frame = video[i + args.skip*1, None]
     next_frame = video[i + args.skip*2, None]
 
+    # i is the index of the 0th frame
+
+    pts3d = np.load(args.video_path[:-4] + "_pcd.npy")
+    pts3d_seg = np.load(args.video_path[:-4] + "_seg.npy")
+
+    seg0, seg1, seg2 = pts3d_seg[i] == 2, pts3d_seg[i + args.skip*1] == 2, pts3d_seg[i + args.skip*2] == 2
+
     is_beginning = False
 
     if R1 is None and t1 is None:
@@ -306,83 +313,72 @@ def reconstruct_3_frames(K, R0, t0, video, i, flow_model, args, R1 = None, t1 = 
     x1 = x1.cpu().detach().numpy().astype(np.float32)
     x2 = x2.cpu().detach().numpy().astype(np.float32)
 
-    # P0 = K @ np.hstack((R0, t0))  # First camera
-    P0 = np.hstack((R0, t0))
+    # x0_seg = seg0[x0[:, 1].astype(int), x0[:, 0].astype(int)]
+    # x1_seg = seg1[x1[:, 1].astype(int), x1[:, 0].astype(int)]
+    # x2_seg = seg2[x2[:, 1].astype(int), x2[:, 0].astype(int)]
+    # # Seg mask works
 
-    # Recover pose of first camera
-    if is_beginning:
+    # seg_mask = x0_seg * x1_seg * x2_seg
+    # x0, x1, x2 = x0[seg_mask], x1[seg_mask], x2[seg_mask]
+    # x0 = x0[:, ::-1]
+    # x1 = x1[:, ::-1]
+    # x2 = x2[:, ::-1]
 
-        # Get Essential Matrix
-        # F, _ = cv2.findFundamentalMat(x0, x1, method=cv2.RANSAC, prob=0.999, threshold=1.0)
-        # E = K.T @ F @ K
-        # E = F_to_E(E)
+    img0 = prev_frame[0].cpu().detach().numpy()
+    img1 = curr_frame[0].cpu().detach().numpy()
+    img2 = next_frame[0].cpu().detach().numpy()
+    lines_img = np.vstack((img0, img1, img2))
 
-        E, _ = cv2.findEssentialMat(x0, x1, K, method=cv2.RANSAC, prob=0.999, threshold=1.0)
+    x1_prime = x1.copy()
+    x1_prime[:, 1] = x1[:, 1] + img1.shape[0]
+    x2_prime = x2.copy()
+    x2_prime[:, 1] = x2[:, 1] + 2*img1.shape[0] 
 
-        # rot1, rot2, trans = cv2.decomposeEssentialMat(E)
-        # poses = [
-        #     np.hstack((rot1, trans)),
-        #     np.hstack((rot1, -trans)),
-        #     np.hstack((rot2, trans)),
-        #     np.hstack((rot2, -trans)),
-        # ]
+    # Sample 10 random points:
+    pt_indices = np.random.choice(x0.shape[0], 10, replace=False)
+    x = x0[pt_indices]
+    x1_prime = x1_prime[pt_indices]
+    x2_prime = x2_prime[pt_indices]
 
-        # Check cheirality condition for each pose
-        # max_valid_points = 0
-        # best_pose = None
+    for k in range(x.shape[0]):
+        cv2.line(lines_img, x0[k, :].astype(np.int64), x1_prime[k, :].astype(np.int64), color = [0, 255, 0], thickness = 3)
+        cv2.line(lines_img, x1_prime[k, :].astype(np.int64), x2_prime[k, :].astype(np.int64), color = [0, 255, 0], thickness = 3)
 
-        # for pose in poses:
-        #     # Triangulate points
-        #     # pts1_h = cv2.convertPointsToHomogeneous(pts1).reshape(-1, 3).T
-        #     # pts2_h = cv2.convertPointsToHomogeneous(pts2).reshape(-1, 3).T
+    cv2.imwrite("lines_img.jpg", lines_img)
 
-        #     pts_3d_h = cv2.triangulatePoints(P0, pose, x0.T, x1.T)
-        #     pts_3d = cv2.convertPointsFromHomogeneous(pts_3d_h.T).reshape(-1, 3)
+    # Look inside the get_pointcloud() function,
+    # x --> width
+    # y --> height (this is probably the opposite of our correspondences)
+    X3D = pts3d[x0[:, 1].astype(int), x0[:, 0].astype(int)]
+    rgb = rgb[seg_mask]
 
-        #     # Visualize:
-        #     # geometries = visualized_3d_2frames(pts_3d, pose[:, :3], pose[:, -1])
-        #     # o3d.visualization.draw_geometries(geometries, window_name="Reconstruction")
+    #obj_id = 2
 
-        #     # Check if points are in front of both cameras
-        #     z1 = pts_3d[:, 2]
-        #     z2 = (pose[:, :3] @ pts_3d.T + pose[:, 3:]).T[:, 2]
+    # First camera
+    P0 = K @ np.hstack((R0, t0))
+    
+    # Get 2nd camera:
+    ret, rvecs, tvecs = cv2.solvePnP(X3D, x1[:, ::-1], K, None)
+    R1 = cv2.Rodrigues(rvecs)[0]
+    t1 = tvecs
 
-        #     valid_points = (z1 > 0) & (z2 > 0)
-        #     num_valid_points = valid_points.sum()
-
-        #     # Update best pose if more valid points are found
-        #     if num_valid_points > max_valid_points:
-        #         max_valid_points = num_valid_points
-        #         best_pose = pose.copy()
-
-        # random_inds = np.random.choice(x0.shape[0], (8,), replace=False)
-        # plot_epipolar_lines(F, x0[random_inds], x1[random_inds], prev_frame[0].cpu().detach().numpy(), curr_frame[0].cpu().detach().numpy())
-
-        # Recover second camera poses
-        _, R1, t1, mask = cv2.recoverPose(E, x0, x1, K)
-        # R1 = best_pose[:, :3]
-        # t1 = best_pose[:, -1, None]
-        # R1 = R0 @ R1
-        # t1 = t0 + t1
+    # Get 3rd camera:
+    ret, rvecs, tvecs = cv2.solvePnP(X3D, x2[:, ::-1], K, None)
+    R2 = cv2.Rodrigues(rvecs)[0]
+    t2 = tvecs
 
     # Recover cameras:
-    P0 = K @ P0
+    # P0 = K @ P0
     P1 = K @ np.hstack((R1, t1)) 
 
     # Triangulate:
-    X3D = cv2.triangulatePoints(P0, P1, x0.T, x1.T)
-    X3D = X3D[:3, :] / X3D[3, :]
-    X3D = X3D.T
+    # X3D = cv2.triangulatePoints(P0, P1, x0.T, x1.T)
+    # X3D = X3D[:3, :] / X3D[3, :]
+    # X3D = X3D.T
 
     # Visualize:
-    if is_beginning:
-        geometries = visualized_3d_2frames(X3D, R1, t1[:, 0], rgb_ = rgb)
-        o3d.visualization.draw_geometries(geometries, window_name="Reconstruction")
-
-    # Get 3rd camera:
-    ret, rvecs, tvecs = cv2.solvePnP(X3D, x2, K, None)
-    R2 = cv2.Rodrigues(rvecs)[0]
-    t2 = tvecs
+    geometries = visualized_3d_2frames(X3D, R1, t1[:, 0], size = 0.05)
+    o3d.visualization.draw_geometries(geometries, window_name="Reconstruction")
 
     # Visualize:
     # geometries = visualized_3d_3frames(X3D, R1, t1[:, 0], R2, t2)

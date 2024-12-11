@@ -189,6 +189,8 @@ def create_flow_correspondence_video(video, model, args):
         for k in range(x.shape[0]):
           cv2.line(lines_img, x[k, :].astype(np.int64), x_prime[k, :].astype(np.int64), color = [0, 255, 0], thickness = 3)
 
+        
+        lines_img = cv2.cvtColor(lines_img, cv2.COLOR_BGR2RGB)
         writer.write(lines_img)
 
   cap.release()
@@ -242,15 +244,15 @@ def correspondences_from_flow_mask(flow, flow_mask, args):
 
   return x, x_prime 
 
-def visualized_3d_2frames(X3D, R, t):
+def visualized_3d_2frames(X3D, R, t, size=2., rgb_ = None):
 
   T1 = np.eye(4)
   T1[:3, :3] = R
   T1[:3, 3] = t
 
   geometries = []
-  frame1 = o3d.geometry.TriangleMesh.create_coordinate_frame(size=2., origin=[0, 0, 0])
-  frame2 = o3d.geometry.TriangleMesh.create_coordinate_frame(size=2., origin=[0, 0, 0])
+  frame1 = o3d.geometry.TriangleMesh.create_coordinate_frame(size=size, origin=[0, 0, 0])
+  frame2 = o3d.geometry.TriangleMesh.create_coordinate_frame(size=size, origin=[0, 0, 0])
   frame2.transform(T1.copy())
 
   geometries.append(frame1)
@@ -260,6 +262,12 @@ def visualized_3d_2frames(X3D, R, t):
   pcd[:, :] = X3D[:, :]
   pts_vis = o3d.geometry.PointCloud()
   pts_vis.points = o3d.utility.Vector3dVector(pcd)
+
+  if rgb_ is not None:
+    rgb = np.zeros((X3D.shape[0], 3))
+    rgb[:, :] = rgb_
+    pts_vis.colors = o3d.utility.Vector3dVector(rgb)
+    
   geometries.append(pts_vis)
 
   return geometries
