@@ -49,15 +49,15 @@ def calc_flow(args, model, image1, image2):
   info_down = F.interpolate(info, scale_factor=0.5 ** args.scale, mode='area')
   return flow_down, info_down
 
-def predict_flow(video, model, args, period = 1):
+def predict_flow(video, model, args):
   """
   video => torch tensor of shape (frames, H, W, 3)
   """
 
   vid_input = torch.permute(video, (0, 3, 1, 2))    # Now vid_input is (frames, 3, H, W)   (0, 2, 3, 1)
 
-  frame1 = vid_input[:-period]
-  frame2 = vid_input[period:]
+  frame1 = vid_input[:-args.skip]
+  frame2 = vid_input[args.skip:]
 
   flow, _ = calc_flow(args, model, frame1, frame2)    # Flow is predicted in (frames, 2, H, W)
   flow = torch.permute(flow, (0, 2, 3, 1))            # Now flow is (frames, H, W, 2)
@@ -76,7 +76,7 @@ def predict_flow_images(image1, image2, model, args):
 
   return flow
 
-def create_flow_heatmap(video, model, args, period = 1):
+def create_flow_heatmap(video, model, args):
   """
   flow => torch tensor of shape (frames, H, W, 2)
   """
@@ -98,7 +98,7 @@ def create_flow_heatmap(video, model, args, period = 1):
   print("Creating Heatmap:")
   for i in tqdm(range(num_batches)):
 
-    flow = predict_flow(video[(i * args.batch) : ((i+1) * args.batch)], model, args, period)
+    flow = predict_flow(video[(i * args.batch) : ((i+1) * args.batch)], model, args)
     
     for j in range(flow.shape[0]):
       
@@ -108,7 +108,7 @@ def create_flow_heatmap(video, model, args, period = 1):
   cap.release()
   writer.release()
 
-def create_flow_mask_heatmap(video, model, args, period = 1):
+def create_flow_mask_heatmap(video, model, args):
   """
   flow => torch tensor of shape (frames, H, W, 2)
   """
@@ -130,7 +130,7 @@ def create_flow_mask_heatmap(video, model, args, period = 1):
   print("Creating Heatmap:")
   for i in tqdm(range(num_batches)):
 
-    flow = predict_flow(video[(i * args.batch) : ((i+1) * args.batch)], model, args, period)
+    flow = predict_flow(video[(i * args.batch) : ((i+1) * args.batch)], model, args)
     flow_mask = create_flow_mask(flow, args)    # flow_mask is (frames, H, W)
     masked_flow = flow * flow_mask.unsqueeze(-1).float()
     
@@ -142,7 +142,7 @@ def create_flow_mask_heatmap(video, model, args, period = 1):
   cap.release()
   writer.release()
 
-def create_flow_correspondence_video(video, model, args, period = 1):
+def create_flow_correspondence_video(video, model, args):
   """
   flow => torch tensor of shape (frames, H, W, 2)
   """
@@ -164,7 +164,7 @@ def create_flow_correspondence_video(video, model, args, period = 1):
   print("Creating Heatmap:")
   for i in tqdm(range(num_batches)):
 
-    flow = predict_flow(video[(i * args.batch) : ((i+1) * args.batch)], model, args, period)
+    flow = predict_flow(video[(i * args.batch) : ((i+1) * args.batch)], model, args)
     
     for j in range(flow.shape[0]):
 
@@ -189,6 +189,8 @@ def create_flow_correspondence_video(video, model, args, period = 1):
         for k in range(x.shape[0]):
           cv2.line(lines_img, x[k, :].astype(np.int64), x_prime[k, :].astype(np.int64), color = [0, 255, 0], thickness = 3)
 
+        
+        lines_img = cv2.cvtColor(lines_img, cv2.COLOR_BGR2RGB)
         writer.write(lines_img)
 
   cap.release()
@@ -242,15 +244,15 @@ def correspondences_from_flow_mask(flow, flow_mask, args):
 
   return x, x_prime 
 
-def visualized_3d_2frames(X3D, R, t):
+def visualized_3d_2frames(X3D, R, t, size=2., rgb_ = None):
 
   T1 = np.eye(4)
   T1[:3, :3] = R
   T1[:3, 3] = t
 
   geometries = []
-  frame1 = o3d.geometry.TriangleMesh.create_coordinate_frame(size=2., origin=[0, 0, 0])
-  frame2 = o3d.geometry.TriangleMesh.create_coordinate_frame(size=2., origin=[0, 0, 0])
+  frame1 = o3d.geometry.TriangleMesh.create_coordinate_frame(size=size, origin=[0, 0, 0])
+  frame2 = o3d.geometry.TriangleMesh.create_coordinate_frame(size=size, origin=[0, 0, 0])
   frame2.transform(T1.copy())
 
   geometries.append(frame1)
@@ -260,6 +262,12 @@ def visualized_3d_2frames(X3D, R, t):
   pcd[:, :] = X3D[:, :]
   pts_vis = o3d.geometry.PointCloud()
   pts_vis.points = o3d.utility.Vector3dVector(pcd)
+
+  if rgb_ is not None:
+    rgb = np.zeros((X3D.shape[0], 3))
+    rgb[:, :] = rgb_
+    pts_vis.colors = o3d.utility.Vector3dVector(rgb)
+    
   geometries.append(pts_vis)
 
   return geometries

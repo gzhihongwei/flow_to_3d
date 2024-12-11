@@ -1,0 +1,22 @@
+# !!! These are global to everything, you may want to put them elsewhere
+scene: cracker_box
+# exp_name: three_cubes2
+
+scene_config_folder: config/
+objects_folder: assets/objects/
+
+# Simulation parameters:
+max_control_iters: 1000
+tolerance: 0.001
+stability_iters: 1000
+gripper_close: 1.
+gripper_open: 0.01771439
+max_joint_force: 240.
+max_frames: 50
+
+# Suggester parameters:
+num_suggestions: 4
+weights_folder: assets/weights/
+weights_file: run1_epoch_1074_step_134375.ckpt
+model_config_folder: ../../../configs/training/
+model_config_file: taxpose_vtamp.yaml

@@ -9,7 +9,8 @@ import numpy as np
 import cv2
 import matplotlib.pyplot as plt
 
-from flow_utils import predict_flow_images, correspondences_from_flow_mask, create_flow_mask
+from flow_utils import predict_flow_images, correspondences_from_flow_mask, create_flow_mask, visualized_3d_2frames
+from views import plot_epipolar_lines
 
 torch.autograd.set_detect_anomaly(True)
 
@@ -298,28 +299,74 @@ def reconstruct_3_frames(K, R0, t0, video, i, flow_model, args, R1 = None, t1 = 
     correspondence_mask = (back_flow_mask * forward_flow_mask).bool()[0]
     rgb = curr_frame[:, correspondence_mask].cpu().detach().numpy()[0] / 255.
 
-    x1, x0 = correspondences_from_flow_mask(back_flow[0], correspondence_mask, args)
     x1, x2 = correspondences_from_flow_mask(forward_flow[0], correspondence_mask, args)
+    x1, x0 = correspondences_from_flow_mask(back_flow[0], correspondence_mask, args)
 
     x0 = x0.cpu().detach().numpy().astype(np.float32)
     x1 = x1.cpu().detach().numpy().astype(np.float32)
     x2 = x2.cpu().detach().numpy().astype(np.float32)
 
+    # P0 = K @ np.hstack((R0, t0))  # First camera
+    P0 = np.hstack((R0, t0))
+
     # Recover pose of first camera
     if is_beginning:
 
         # Get Essential Matrix
-        F, _ = cv2.findFundamentalMat(x0, x1, method=cv2.FM_8POINT)
-        E = K.T @ F @ K
-        E = F_to_E(E)
+        # F, _ = cv2.findFundamentalMat(x0, x1, method=cv2.RANSAC, prob=0.999, threshold=1.0)
+        # E = K.T @ F @ K
+        # E = F_to_E(E)
+
+        E, _ = cv2.findEssentialMat(x0, x1, K, method=cv2.RANSAC, prob=0.999, threshold=1.0)
+
+        # rot1, rot2, trans = cv2.decomposeEssentialMat(E)
+        # poses = [
+        #     np.hstack((rot1, trans)),
+        #     np.hstack((rot1, -trans)),
+        #     np.hstack((rot2, trans)),
+        #     np.hstack((rot2, -trans)),
+        # ]
+
+        # Check cheirality condition for each pose
+        # max_valid_points = 0
+        # best_pose = None
+
+        # for pose in poses:
+        #     # Triangulate points
+        #     # pts1_h = cv2.convertPointsToHomogeneous(pts1).reshape(-1, 3).T
+        #     # pts2_h = cv2.convertPointsToHomogeneous(pts2).reshape(-1, 3).T
+
+        #     pts_3d_h = cv2.triangulatePoints(P0, pose, x0.T, x1.T)
+        #     pts_3d = cv2.convertPointsFromHomogeneous(pts_3d_h.T).reshape(-1, 3)
+
+        #     # Visualize:
+        #     # geometries = visualized_3d_2frames(pts_3d, pose[:, :3], pose[:, -1])
+        #     # o3d.visualization.draw_geometries(geometries, window_name="Reconstruction")
+
+        #     # Check if points are in front of both cameras
+        #     z1 = pts_3d[:, 2]
+        #     z2 = (pose[:, :3] @ pts_3d.T + pose[:, 3:]).T[:, 2]
+
+        #     valid_points = (z1 > 0) & (z2 > 0)
+        #     num_valid_points = valid_points.sum()
+
+        #     # Update best pose if more valid points are found
+        #     if num_valid_points > max_valid_points:
+        #         max_valid_points = num_valid_points
+        #         best_pose = pose.copy()
+
+        # random_inds = np.random.choice(x0.shape[0], (8,), replace=False)
+        # plot_epipolar_lines(F, x0[random_inds], x1[random_inds], prev_frame[0].cpu().detach().numpy(), curr_frame[0].cpu().detach().numpy())
 
         # Recover second camera poses
         _, R1, t1, mask = cv2.recoverPose(E, x0, x1, K)
+        # R1 = best_pose[:, :3]
+        # t1 = best_pose[:, -1, None]
         # R1 = R0 @ R1
         # t1 = t0 + t1
 
     # Recover cameras:
-    P0 = K @ np.hstack((R0, t0))  # First camera
+    P0 = K @ P0
     P1 = K @ np.hstack((R1, t1)) 
 
     # Triangulate:
@@ -328,8 +375,9 @@ def reconstruct_3_frames(K, R0, t0, video, i, flow_model, args, R1 = None, t1 = 
     X3D = X3D.T
 
     # Visualize:
-    # geometries = visualized_3d_2frames(X3D, R1, t1[:, 0])
-    # # o3d.visualization.draw_geometries(geometries, window_name="Reconstruction")
+    if is_beginning:
+        geometries = visualized_3d_2frames(X3D, R1, t1[:, 0], rgb_ = rgb)
+        o3d.visualization.draw_geometries(geometries, window_name="Reconstruction")
 
     # Get 3rd camera:
     ret, rvecs, tvecs = cv2.solvePnP(X3D, x2, K, None)
