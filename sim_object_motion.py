@@ -18,5 +18,3 @@ force_pt = np.array([0., 0., 0.])
 vid_path = "assets/videos/simulation/tomato_soup_can.mp4"
 
 env.move_object(obj_id, force_pt, force_vec, vid_path)
-
-print("")

@@ -19,6 +19,3 @@ weights
 *.npy
 *.npz
 .vscode
-assets/
-custom/
-presentation/

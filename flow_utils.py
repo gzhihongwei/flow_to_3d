@@ -19,7 +19,6 @@ def read_video(args):
   return frames
 
 def load_flow_model(args):
-
   model = RAFT.from_pretrained(args.url, args=args)
   model = model.to(args.device)
   model.eval()

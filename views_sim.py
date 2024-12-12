@@ -138,74 +138,8 @@ class GlobalOptimization(nn.Module):
         t1 = self.cam1.t.cpu().detach().numpy()
         t2 = self.cam2.t.cpu().detach().numpy()
         return X, R1, R2, t1, t2
-        
     
-    @torch.no_grad()
-    def triangulate(self, rgb = None):
-        self.set_K()
-
-        P1 = torch.zeros((1, 3, 4), dtype=torch.float32, device = "cuda")
-        P1[:, :3, :3] = self.K
-
-        P2 = torch.tensor(self.cameras.camera_matrix(), dtype=torch.float32, device = "cuda").unsqueeze(0)
-        P2 = torch.matmul(self.K.cuda(), P2)
-
-        x = self.x.cuda()
-        x_prime = self.x_prime.cuda()
-
-        x1_skew = skew_symmetric_matrix(homogenize(x))
-        x2_skew = skew_symmetric_matrix(homogenize(x_prime))
-
-        constraint1 = torch.matmul(x1_skew[..., :-1, :], P1)
-        constraint2 = torch.matmul(x2_skew[..., :-1, :], P2)
-
-        constraint_matrix = torch.concat([constraint1, constraint2], dim = -2)
-        U, S, Vh = torch.linalg.svd(constraint_matrix)
-        X = Vh[..., -1, :]
-
-        pts3d = (X / X[:, -1, None])[:, :-1].cpu()
-
-        pcd = np.zeros((pts3d.size(0), 3))
-        pcd[:, :] = pts3d.cpu().detach().numpy()
-
-        if rgb is not None:
-            colors = np.zeros((X.size(0), 3))
-            colors[:, :] = (rgb / 255.).cpu().detach().numpy()
-
-        geometries = []
-        pts_vis = o3d.geometry.PointCloud()
-        pts_vis.points = o3d.utility.Vector3dVector(pcd)
-        if rgb is not None:
-            pts_vis.colors = o3d.utility.Vector3dVector(colors)
-        geometries.append(pts_vis)
-
-        o3d.visualization.draw_geometries(geometries, window_name="Reconstruction")
-
-        return pts3d
-
-    @torch.no_grad()
-    def plot(self, rgb = None):
-
-        X = self.depth.abs() * torch.matmul(torch.linalg.inv(self.K), self.homogenize(self.x).t())
-
-        pcd = np.zeros((X.size(0), 3))
-        pcd[:, :] = X.cpu().detach().numpy()
-
-        if rgb is not None:
-            colors = np.zeros((X.size(0), 3))
-            colors[:, :] = (rgb / 255.).cpu().detach().numpy()
-
-        geometries = []
-        pts_vis = o3d.geometry.PointCloud()
-        pts_vis.points = o3d.utility.Vector3dVector(pcd)
-        if rgb is not None:
-            pts_vis.colors = o3d.utility.Vector3dVector(colors)
-        geometries.append(pts_vis)
-
-        o3d.visualization.draw_geometries(geometries, window_name="Reconstruction")
-
-        return geometries
-
+    
 def homogenize_2d(pts):
     
     assert pts.shape[-1] == 3 or pts.shape[-1] == 2
@@ -214,68 +148,91 @@ def homogenize_2d(pts):
         return np.append(pts, np.ones((*pts.shape[:-1], 1)), axis = -1)
     else:
         return pts
-
-def skew_symmetric_matrix(v, mode = "torch"):
-
-    if mode == 'torch':
-        matrix = torch.zeros((*v.shape[:-1], 3, 3), device=v.device)
-    elif mode == "numpy":
-        matrix = np.zeros((*v.shape[:-1], 3, 3))
     
-    matrix[..., 0, 1] = -v[..., 2]
-    matrix[..., 0, 2] = v[..., 1]
-    matrix[..., 1, 2] = -v[..., 0]
-
-    matrix[..., 1, 0] = v[..., 2]
-    matrix[..., 2, 0] = -v[..., 1]
-    matrix[..., 2, 1] = v[..., 0]
-
-    return matrix
-
-def get_correspondences(flow, image):
-
-    H = flow.size(1)
-    W = flow.size(2)
-    image = image.permute(0, 2, 3, 1)
-
-    flow_mag = torch.norm(flow, p=1, dim=-1)
-    flow_mask = (flow_mag > 20)
-    # self.flow_mask = (flow_mag > 20).float()
     
-    vv, uu = torch.meshgrid(torch.arange(H, device=flow.device), torch.arange(W, device=flow.device), indexing="ij")
+def epipolar_lines(F, pts1, pts2):
 
-    # Principal point is (0,0):
-    vv = vv - H/2
-    uu = uu - W/2
-
-    indices = torch.stack((uu, vv), dim=0).unsqueeze(0)
-    indices = indices.permute(0, 2, 3, 1)
-
-    # Note; Indices are switched and added to flow, because the flow predictions are switched => (x, y) corresponds to (W, H)
-    # homogenized_inds = homogenize(indices)
-
-    correspondences = indices + flow
-    # homogenized_corr = homogenize(correspondences)
-
-    indices = indices[flow_mask]
-    correspondences = correspondences[flow_mask]
-    rgb = image[flow_mask]
+    pts1 = homogenize_2d(pts1)
+    pts2 = homogenize_2d(pts2)
     
-def homogenize(v):
-    ones = np.ones((*v.shape[:-1], 1))
-    return np.concatenate((v, ones), axis=-1)
+    l1 = ((F.T) @ (pts2.T)).T
+    l2 = (F @ (pts1.T)).T
 
-def F_to_E(F):
+    return l1, l2
 
-    U, S, Vh = np.linalg.svd(F)
 
-    S_ones = np.eye(3)
-    S_ones[-1, -1] = 0
+def find_line_intersect_with_borders(line, img):
 
-    E = U @ S_ones @ Vh
+    height, width = img.shape[:2]
+    a, b, c = line[:, 0], line[:, 1], line[:, 2]
 
-    return E
+    x0 = np.zeros_like(a)
+    y0 = -c/b
+    x1 = np.ones_like(a) * width-1
+    y1 = (-a * (width-1) -c) / b
 
+    line_pts = np.column_stack([x0, y0, x1, y1])
+    
+    return line_pts
+
+
+def plot_epipolar_lines(F, pts1, pts2, img1, img2):
+
+    el1, el2 = epipolar_lines(F, pts1, pts2)
+
+    el1_pts = find_line_intersect_with_borders(el1, img1)
+    el2_pts = find_line_intersect_with_borders(el2, img2)
+
+    img1_pts = img1.copy()
+    for i in range(pts1.shape[0]):
+        cv2.circle(img1_pts, tuple(pts1[i, :2].astype(np.int64)), radius=8, color=COLORS[i], thickness=-1)
+
+    # cv2.imshow('Viewpoint 1 Points', img1_pts)
+    cv2.imwrite('img1_pts.jpg', img1_pts)
+    
+    # plt.imshow(img1_pts)
+    # plt.show()
+    # cv2.waitKey(0)
+
+    img2_lines = img2.copy()
+    for i in range(el2_pts.shape[0]):
+        line = el2_pts[i].astype(np.int64)
+        cv2.line(img2_lines, (line[0], line[1]), (line[2], line[3]), color=COLORS[i], thickness=4)     # line is arranged as (x0, y0, x1, y1)
+
+    cv2.imwrite('img2_lines.jpg', img2_lines)
+    # cv2.imshow('Viewpoint 2 Lines', img2_lines)
+    # cv2.waitKey(0)
+
+    # plt.imshow(img2_lines)
+    # plt.show()
+
+    img2_pts = img2.copy()
+    for i in range(pts2.shape[0]):
+        cv2.circle(img2_pts, tuple(pts2[i, :2].astype(np.int64)), radius=8, color=COLORS[i], thickness=-1)
+
+    cv2.imwrite('img2_pts.jpg', img2_pts)
+    # cv2.imshow('Viewpoint 2 Points', img2_pts)
+    # cv2.waitKey(0)
+
+    # plt.imshow(img2_pts)
+    # plt.show()
+
+    img1_lines = img1.copy()
+    for i in range(el1_pts.shape[0]):
+        line = el1_pts[i].astype(np.int64)
+        cv2.line(img1_lines, (line[0], line[1]), (line[2], line[3]), color=COLORS[i], thickness=4)     # line is arranged as (x0, y0, x1, y1)
+
+    # cv2.imshow('Viewpoint 1 Lines', img1_lines)
+    # cv2.waitKey(0)
+
+    cv2.imwrite('img1_lines.jpg', img1_lines)
+    # plt.imshow(img1_lines)
+    # plt.show()
+
+    # cv2.destroyAllWindows()
+
+    return img1_pts, img2_pts, img1_lines, img2_lines
+        
 
 def reconstruct_3_frames(K, R0, t0, video, i, flow_model, args, R1 = None, t1 = None):
     prev_frame = video[i, None]
@@ -313,16 +270,16 @@ def reconstruct_3_frames(K, R0, t0, video, i, flow_model, args, R1 = None, t1 = 
     x1 = x1.cpu().detach().numpy().astype(np.float32)
     x2 = x2.cpu().detach().numpy().astype(np.float32)
 
-    # x0_seg = seg0[x0[:, 1].astype(int), x0[:, 0].astype(int)]
-    # x1_seg = seg1[x1[:, 1].astype(int), x1[:, 0].astype(int)]
-    # x2_seg = seg2[x2[:, 1].astype(int), x2[:, 0].astype(int)]
-    # # Seg mask works
+    x0_seg = seg0[x0[:, 1].astype(int), x0[:, 0].astype(int)]
+    x1_seg = seg1[x1[:, 1].astype(int), x1[:, 0].astype(int)]
+    x2_seg = seg2[x2[:, 1].astype(int), x2[:, 0].astype(int)]
+    # Seg mask works
 
-    # seg_mask = x0_seg * x1_seg * x2_seg
-    # x0, x1, x2 = x0[seg_mask], x1[seg_mask], x2[seg_mask]
-    # x0 = x0[:, ::-1]
-    # x1 = x1[:, ::-1]
-    # x2 = x2[:, ::-1]
+    seg_mask = x0_seg * x1_seg * x2_seg
+    x0, x1, x2 = x0[seg_mask], x1[seg_mask], x2[seg_mask]
+    x0 = x0[:, ::-1]
+    x1 = x1[:, ::-1]
+    x2 = x2[:, ::-1]
 
     img0 = prev_frame[0].cpu().detach().numpy()
     img1 = curr_frame[0].cpu().detach().numpy()
@@ -391,34 +348,12 @@ def reconstruct_3_frames(K, R0, t0, video, i, flow_model, args, R1 = None, t1 = 
     global_opt.to(args.device)
     optimizer = torch.optim.AdamW(global_opt.parameters(), lr = args.lr)
 
-    # losses = []
     for _ in tqdm(range(args.iterations)):
         optimizer.zero_grad()
         loss = global_opt()
         loss.backward()
         optimizer.step()
-        # losses.append(loss.item())
-
-    # print(loss.item())
-    # plt.plot(losses[1000:])
-    # plt.gca().set_aspect('equal', adjustable='box')
-    # plt.show()
 
     X, R1, R2, t1, t2 = global_opt.get_params()
 
     return X, R1, R2, t1, t2, rgb
-
-    # # Visualize:
-    # geometries = visualized_3d_3frames(X, R1, t1, R2, t2)
-    # o3d.visualization.draw_geometries(geometries, window_name="Reconstruction")
-
-
-def invert_similarity_transform(T):
-    R = T[:3, :3]
-    t = T[:3, 3]
-    
-    T_inv = np.eye(4)
-    T_inv[:3, :3] = R.T
-    T_inv[:3, 3] = -R.T @ t
-
-    return T_inv
