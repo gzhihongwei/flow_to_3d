@@ -1,0 +1,43 @@
+camera:
+
+  mode: "distance"    # or "position"
+
+  target: [0.1, 0., 0.7]
+
+  # For distance mode:
+  distance: 0.2
+  yaw: 135.
+  pitch: -20.
+  roll: 0.
+  up_axis_index: 2
+
+  # For position mode:
+  eye: [1., 1., 1.]
+  up_vec: [0., 0., 1.]
+
+  # Intrinsics:
+  width: 1024
+  height: 1024
+  fov: 60
+  near: 0.02
+  far: 50
+
+  # If camera is already saved somewhere:
+  view_matrix: None
+  projection_matrix: None
+
+objects:
+
+  table:
+    file: table.urdf
+    pos: [0., 0., 0.]
+    orn: [0., 0., 0., 1.]
+    scale: 1.
+    fixed_base: true
+
+  object:
+    file: 005_tomato_soup_can.urdf
+    pos: [0.1, 0., 0.75]
+    orn: [0., 0., 0., 1.]
+    scale: 0.05
+    fixed_base: false
