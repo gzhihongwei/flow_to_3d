@@ -1,4 +1,4 @@
-# Flow to 3D: Recovering Object Motion and Reconstructing from Monocular RGB Video
+# Flow to 3D: Reconstructing a Moving Object from Monocular RGB Video
 
 We present our project Flow to 3D, built on top of [SEA-RAFT](https://github.com/princeton-vl/SEA-RAFT). We primarily rely on optical flow to find pixel correspondences because we have a stationary monocular RGB video and a rigid-body object moving in the video. From these pixel correspondences, we are able to recover the camera poses and 3D point cloud. We then use a sliding window approach to refine camera poses and the point cloud.
 
@@ -23,7 +23,7 @@ To visualize the optical flow and correspondences, run
 
 ```Shell
 python generate_flow_seg.py \
---video_path assets/can.mp4 \
+--video_path assets/can.mp4 \  # Look in assets/ for more videos
 --batch 10
 ```
 
@@ -32,7 +32,7 @@ Place any videos (\*.mp4), camera intrinsics (\*.npy) in `assets/`. To run an ex
 ```Shell
 python reconstruct.py \
 --intrinsics_path assets/intrinsics.npy \
---video_path assets/can.mp4 \
+--video_path assets/can.mp4 \  # Look in assets/ for more videos
 --thresh 10 \
 --skip 2
 ```
